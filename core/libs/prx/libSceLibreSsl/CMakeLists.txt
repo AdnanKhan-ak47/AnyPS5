@@ -99,6 +99,17 @@ if(BUILD_TESTING)
         set_tests_properties(guest_libressl_ssl_ctx PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceLibreSsl>")
     endif()
+
+    add_test_executable(guest_libressl_ssl_ctx_fields_tests ${LIBS_INCLUDE_DIR}/tests/GuestLibreSslSslCtxFields.cpp)
+    target_include_directories(guest_libressl_ssl_ctx_fields_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_libressl_ssl_ctx_fields_tests PRIVATE libSceLibreSsl libc)
+    configure_windows_unwind(guest_libressl_ssl_ctx_fields_tests)
+    add_test(NAME guest_libressl_ssl_ctx_fields COMMAND guest_libressl_ssl_ctx_fields_tests)
+    set_tests_properties(guest_libressl_ssl_ctx_fields PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(guest_libressl_ssl_ctx_fields PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceLibreSsl>")
+    endif()
 endif()
 
 target_sources(libSceLibreSsl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/Cipher.cpp)
