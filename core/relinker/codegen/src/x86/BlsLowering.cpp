@@ -120,15 +120,15 @@ void EmitBls(StubBodyBuilder& body, const BlsOperands& operands) {
     body.Raw(nonzero);
     body.Raw(std::array{std::uint8_t{0xEB}, static_cast<std::uint8_t>(zero.size())});
     body.Raw(zero);
+    StackSlot(body, 0x8B, true, temporary, 8);
     if (operands.Destination == Stack)
-        StackSlot(body, 0x89, operands.Wide, result, 16);
+        StackSlot(body, 0x89, operands.Wide, result, 8);
     else
         Register(body, 0x8B, operands.Wide, operands.Destination, result);
     StackSlot(body, 0x8B, true, result, 0);
-    StackSlot(body, 0x8B, true, temporary, 8);
     StackSlot(body, 0x8D, true, Stack, FrameSize);
     if (operands.Destination == Stack)
-        StackSlot(body, 0x8B, operands.Wide, Stack, 16 - FrameSize);
+        StackSlot(body, 0x8B, operands.Wide, Stack, 8 - FrameSize);
 }
 
 }

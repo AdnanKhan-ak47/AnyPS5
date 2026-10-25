@@ -122,7 +122,7 @@ void execution() {
     for (const auto operation : kOperations) {
         for (bool wide : {false, true}) {
             for (std::uint8_t dst = 0; dst < 16; ++dst) {
-                for (const std::uint8_t src : {std::uint8_t{6}, dst, std::uint8_t{4}, std::uint8_t{10}}) {
+                for (const std::uint8_t src : std::array<std::uint8_t, 4>{6, dst, 4, 10}) {
                     const auto site = instruction(operation, wide, dst, src);
                     const auto run = executable(site, 0);
                     for (const auto value : values) {
@@ -134,7 +134,7 @@ void execution() {
                 }
             }
             for (const Bytes tail : {Bytes{0x06}, Bytes{0x46, 0x10}, Bytes{0x84, 0x24, 0x40, 0, 0, 0}, Bytes{0x04, 0xCA}, Bytes{0x85, 0x10, 0, 0, 0}, Bytes{0x05, 0, 0, 0, 0}}) {
-                for (const auto value : {std::uint64_t{0}, 0xFEDCBA9876543210ull, 0xFFFFFFFF00000000ull}) {
+                for (const auto value : std::array<std::uint64_t, 3>{0, 0xFEDCBA9876543210ull, 0xFFFFFFFF00000000ull}) {
                     Bytes site{0xC4, 0xE2, static_cast<std::uint8_t>(wide ? 0xF8 : 0x78), 0xF3, static_cast<std::uint8_t>(tail[0] | (extension(operation) << 3))};
                     site.insert(site.end(), tail.begin() + 1, tail.end());
                     const auto run = executable(site, value);
