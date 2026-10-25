@@ -90,8 +90,12 @@ std::optional<ShiftOperands> DecodeShift(const std::uint8_t* data, const std::si
 void EmitShift(StubBodyBuilder& body, const ShiftOperands& operands) {
     const auto name = ShiftName(operands.Operation);
     const bool rotate = operands.Operation == ShiftOperation::RotateRight;
-    auto used = operands.Memory ? UsedRegisters({operands.Destination, operands.Count, kCountRegister}, operands.Memory)
-                                : UsedRegisters({operands.Destination, operands.Source, operands.Count, kCountRegister}, std::nullopt);
+    std::array<bool, 16> used{};
+    if (rotate)
+        used = operands.Memory ? UsedRegisters({operands.Destination}, operands.Memory) : UsedRegisters({operands.Destination, operands.Source}, std::nullopt);
+    else
+        used = operands.Memory ? UsedRegisters({operands.Destination, operands.Count, kCountRegister}, operands.Memory)
+                               : UsedRegisters({operands.Destination, operands.Source, operands.Count, kCountRegister}, std::nullopt);
     const auto result = Scratch(used, name);
     StackSlot(body, 0x8D, true, Stack, -kFrame);
     StackSlot(body, 0x89, true, result, kResultSlot);

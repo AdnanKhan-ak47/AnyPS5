@@ -50,7 +50,10 @@ inline void StackSlot(StubBodyBuilder& body, std::uint8_t opcode, bool wide, std
 inline std::array<bool, 16> UsedRegisters(std::initializer_list<std::uint8_t> registers, const std::optional<MemoryOperand>& memory) {
     std::array<bool, 16> used{};
     used[Stack] = true;
-    for (const auto reg : registers) used[reg] = true;
+    for (const auto reg : registers) {
+        if (reg >= used.size()) throw CodegenException("register index " + std::to_string(reg) + " is out of range");
+        used[reg] = true;
+    }
     if (!memory) return used;
     if (memory->Rm == 4) {
         const auto base = static_cast<std::uint8_t>((memory->Sib & 7) | ((memory->RexIndexBase & 1) << 3));

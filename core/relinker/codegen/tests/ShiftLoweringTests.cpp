@@ -194,7 +194,10 @@ void execution() {
     for (bool wide : {false, true}) {
         for (std::uint8_t dst = 0; dst < 16; ++dst) {
             for (const std::uint8_t src : std::array<std::uint8_t, 4>{6, dst, 4, 10}) {
-                for (const std::uint8_t immediate : std::array<std::uint8_t, 6>{0, 1, 31, 32, 63, 255}) {
+                const bool every = (dst == 0 && src == 6) || dst == src;
+                for (int value = 0; value < 256; ++value) {
+                    const auto immediate = static_cast<std::uint8_t>(value);
+                    if (!every && immediate > 1 && immediate != 31 && immediate != 32 && immediate != 63 && immediate != 255) continue;
                     const auto site = rotate(wide, dst, src, immediate);
                     const auto operands = *Codegen::DecodeShift(site.data(), site.size());
                     const auto execution = executable(site, 0);
