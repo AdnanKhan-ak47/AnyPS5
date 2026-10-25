@@ -107,6 +107,19 @@ int main(int argc, char** argv) {
     for (int which : {0, 1, 2}) {
         *__error_nid_postfix() = 0;
         Require(setitimer_nid_postfix(which, nullptr, nullptr) == -1 && *__error_nid_postfix() == 14, "a read into null did not report EFAULT");
+        for (const auto address : {std::uintptr_t{1}, std::uintptr_t{0xfffffffffffff000}}) {
+            auto* const unmapped = reinterpret_cast<GuestItimerval*>(address);
+            GuestItimerval previous{{11, 22}, {33, 44}};
+            const auto saved = previous;
+            *__error_nid_postfix() = 0;
+            Require(setitimer_nid_postfix(which, unmapped, &previous) == -1 && *__error_nid_postfix() == 14, "an unmapped value did not report EFAULT");
+            Require(std::memcmp(&previous, &saved, sizeof(previous)) == 0, "an unmapped value changed the previous output");
+            *__error_nid_postfix() = 0;
+            Require(setitimer_nid_postfix(which, nullptr, unmapped) == -1 && *__error_nid_postfix() == 14, "an unmapped previous did not report EFAULT");
+            *__error_nid_postfix() = 0;
+            const GuestItimerval idle{};
+            Require(setitimer_nid_postfix(which, &idle, unmapped) == -1 && *__error_nid_postfix() == 14, "an unmapped previous with a value did not report EFAULT");
+        }
         for (const GuestItimerval bad : {GuestItimerval{{0, 0}, {-1, 0}}, GuestItimerval{{0, 0}, {0, -1}},
                  GuestItimerval{{0, 0}, {0, 1000000}}, GuestItimerval{{0, 0}, {INT_MAX / 2 + 1, 0}},
                  GuestItimerval{{-1, 0}, {1, 0}}, GuestItimerval{{0, 1000000}, {1, 0}}, GuestItimerval{{INT_MAX / 2 + 1, 0}, {1, 0}}})

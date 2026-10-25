@@ -501,27 +501,31 @@ int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
     return 0;
 }
 
-int APS5_VABI gettimeofday_nid_postfix(KernelTimeval* tv, KernelTimezone* tz) {
-    KernelTimeval ignoredTime{};
-    if (tv == nullptr) tv = &ignoredTime;
+static bool ReadTimeOfDay(KernelTimeval& tv) {
 #ifdef _WIN32
     FILETIME ft{};
     GetSystemTimePreciseAsFileTime(&ft);
     std::uint64_t t = (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
     t -= 116444736000000000ULL;
-    tv->tv_sec = static_cast<std::int64_t>(t / 10000000ULL);
-    tv->tv_usec = static_cast<std::int64_t>((t % 10000000ULL) / 10ULL);
+    tv.tv_sec = static_cast<std::int64_t>(t / 10000000ULL);
+    tv.tv_usec = static_cast<std::int64_t>((t % 10000000ULL) / 10ULL);
+    return true;
 #else
     struct timeval native{};
-    if (gettimeofday(&native, nullptr) != 0) {
-        return -1;
-    }
-    tv->tv_sec = static_cast<std::int64_t>(native.tv_sec);
-    tv->tv_usec = static_cast<std::int64_t>(native.tv_usec);
+    if (gettimeofday(&native, nullptr) != 0) return false;
+    tv.tv_sec = static_cast<std::int64_t>(native.tv_sec);
+    tv.tv_usec = static_cast<std::int64_t>(native.tv_usec);
+    return true;
 #endif
-    if (tz != nullptr) {
-        tz->tz_minuteswest = 0;
-        tz->tz_dsttime = 0;
+}
+
+int APS5_VABI gettimeofday_nid_postfix(KernelTimeval* tv, KernelTimezone* tz) {
+    KernelTimeval time{};
+    if (!ReadTimeOfDay(time)) return -1;
+    constexpr KernelTimezone zone{0, 0};
+    if ((tv != nullptr && !GuestCopyOut_nid_no_patch(tv, &time, sizeof(time))) || (tz != nullptr && !GuestCopyOut_nid_no_patch(tz, &zone, sizeof(zone)))) {
+        *__error_nid_postfix() = GUEST_EFAULT;
+        return -1;
     }
     return 0;
 }
@@ -704,14 +708,14 @@ int APS5_VABI sceKernelConvertUtcToLocaltime(int64_t utc_time, int64_t* local_ti
 }
 
 int APS5_VABI sceKernelGettimeofday(KernelTimeval* tp) {
-    if (tp == nullptr) return SceKernelErrorEfault;
-    return gettimeofday_nid_postfix(tp, nullptr);
+    KernelTimeval time{};
+    if (!ReadTimeOfDay(time)) return -1;
+    return GuestCopyOut_nid_no_patch(tp, &time, sizeof(time)) ? 0 : SceKernelErrorEfault;
 }
 
 int APS5_VABI sceKernelGettimezone(KernelTimezone* tz) {
-    if (tz == nullptr) return SceKernelErrorEfault;
-    *tz = {0, 0};
-    return 0;
+    constexpr KernelTimezone zone{0, 0};
+    return GuestCopyOut_nid_no_patch(tz, &zone, sizeof(zone)) ? 0 : SceKernelErrorEfault;
 }
 
 uint64_t APS5_VABI sceKernelReadTsc(void) {

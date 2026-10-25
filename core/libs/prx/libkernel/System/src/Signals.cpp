@@ -368,12 +368,12 @@ extern "C" int APS5_VABI getitimer_nid_postfix(int which, GuestItimerval* output
         *__error_nid_postfix() = 22;
         return -1;
     }
-    if (output == nullptr) {
-        *__error_nid_postfix() = 14;
-        return -1;
-    }
     if (which != 0) {
-        *output = {};
+        constexpr GuestItimerval none{};
+        if (!GuestCopyOut_nid_no_patch(output, &none, sizeof(none))) {
+            *__error_nid_postfix() = 14;
+            return -1;
+        }
         return 0;
     }
     GuestItimerval result{};
@@ -390,7 +390,10 @@ extern "C" int APS5_VABI getitimer_nid_postfix(int which, GuestItimerval* output
         result.interval.tv_sec = interval / 1000000;
         result.interval.tv_usec = interval % 1000000;
     }
-    *output = result;
+    if (!GuestCopyOut_nid_no_patch(output, &result, sizeof(result))) {
+        *__error_nid_postfix() = 14;
+        return -1;
+    }
     return 0;
 }
 
@@ -421,7 +424,7 @@ extern "C" int APS5_VABI setitimer_nid_postfix(int which, const GuestItimerval* 
     if (value == nullptr && previous == nullptr) { *__error_nid_postfix() = 14; return -1; }
     GuestItimerval requested{};
     if (value != nullptr) {
-        requested = *value;
+        if (!GuestCopyIn_nid_no_patch(&requested, value, sizeof(requested))) { *__error_nid_postfix() = 14; return -1; }
         if (!ValidItimer(requested.value)) { *__error_nid_postfix() = 22; return -1; }
         if (!ItimerSet(requested.value)) requested.interval = {};
         else if (!ValidItimer(requested.interval)) { *__error_nid_postfix() = 22; return -1; }
@@ -429,7 +432,8 @@ extern "C" int APS5_VABI setitimer_nid_postfix(int which, const GuestItimerval* 
     if (which != ItimerReal) {
         if (ItimerSet(requested.value))
             throw std::runtime_error(std::string("setitimer: ") + (which == ItimerProf ? "ITIMER_PROF" : "ITIMER_VIRTUAL") + " needs process CPU time accounting, which is not implemented");
-        if (previous != nullptr) *previous = {};
+        constexpr GuestItimerval none{};
+        if (previous != nullptr && !GuestCopyOut_nid_no_patch(previous, &none, sizeof(none))) { *__error_nid_postfix() = 14; return -1; }
         return 0;
     }
     if (requested.interval.tv_sec == 0 && requested.interval.tv_usec != 0 && requested.interval.tv_usec < MinExactIntervalMicros)
@@ -448,7 +452,7 @@ extern "C" int APS5_VABI setitimer_nid_postfix(int which, const GuestItimerval* 
             NotifyAlarms(alarms);
         }
     }
-    if (previous != nullptr) *previous = old;
+    if (previous != nullptr && !GuestCopyOut_nid_no_patch(previous, &old, sizeof(old))) { *__error_nid_postfix() = 14; return -1; }
     return 0;
 }
 

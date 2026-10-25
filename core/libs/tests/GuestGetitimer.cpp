@@ -58,6 +58,13 @@ int main() {
         Require(getitimer_nid_postfix(invalid, nullptr) == -1 && *__error_nid_postfix() == 22, "invalid timer validation order changed");
     }
     Require(getitimer_nid_postfix(0, nullptr) == -1 && *__error_nid_postfix() == 14, "null output did not report EFAULT");
+    for (const auto address : {std::uintptr_t{1}, std::uintptr_t{0xfffffffffffff000}}) {
+        auto* const unmapped = reinterpret_cast<GuestItimerval*>(address);
+        for (int which : {0, 1, 2}) {
+            *__error_nid_postfix() = 0;
+            Require(getitimer_nid_postfix(which, unmapped) == -1 && *__error_nid_postfix() == 14, "unmapped output did not report EFAULT");
+        }
+    }
     for (int disarmed : {1, 2}) {
         GuestItimerval output{{11, 22}, {33, 44}};
         *__error_nid_postfix() = 12345;

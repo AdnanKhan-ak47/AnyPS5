@@ -312,6 +312,23 @@ int main() {
     KernelTimezone zone{-1, -1};
     Require(gettimeofday_nid_postfix(nullptr, nullptr) == SCE_OK);
     Require(gettimeofday_nid_postfix(nullptr, &zone) == SCE_OK && zone.tz_minuteswest == 0 && zone.tz_dsttime == 0);
+    constexpr int sceKernelErrorEfault = static_cast<int>(0x8002000e);
+    Require(sceKernelGettimeofday(nullptr) == sceKernelErrorEfault && sceKernelGettimezone(nullptr) == sceKernelErrorEfault);
+    for (const auto address : {std::uintptr_t{1}, std::uintptr_t{0xfffffffffffff000}}) {
+        auto* const unmappedTime = reinterpret_cast<KernelTimeval*>(address);
+        auto* const unmappedZone = reinterpret_cast<KernelTimezone*>(address);
+        KernelTimeval now{-1, -1};
+        *__error_nid_postfix() = 0;
+        Require(gettimeofday_nid_postfix(unmappedTime, nullptr) == -1 && *__error_nid_postfix() == 14);
+        *__error_nid_postfix() = 0;
+        Require(gettimeofday_nid_postfix(&now, unmappedZone) == -1 && *__error_nid_postfix() == 14);
+        *__error_nid_postfix() = 0;
+        Require(gettimeofday_nid_postfix(unmappedTime, &zone) == -1 && *__error_nid_postfix() == 14);
+        Require(sceKernelGettimeofday(unmappedTime) == sceKernelErrorEfault && sceKernelGettimezone(unmappedZone) == sceKernelErrorEfault);
+    }
+    KernelTimeval now{-1, -1};
+    Require(sceKernelGettimeofday(&now) == SCE_OK && now.tv_sec > 0 && now.tv_usec >= 0 && now.tv_usec < 1000000);
+    Require(sceKernelGettimezone(&zone) == SCE_OK && zone.tz_minuteswest == 0 && zone.tz_dsttime == 0);
     const int nullResolutionClocks[] = {GUEST_CLOCK_REALTIME, GUEST_CLOCK_VIRTUAL, GUEST_CLOCK_MONOTONIC, GUEST_CLOCK_SECOND, GUEST_CLOCK_PROCESS_CPUTIME_ID};
     for (const int clockId : nullResolutionClocks) Require(clock_getres_nid_postfix(clockId, nullptr) == SCE_OK);
 
