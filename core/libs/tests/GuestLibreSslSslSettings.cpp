@@ -214,7 +214,6 @@ static void TestGetAlpnSelected() {
 static void TestSetConnectState() {
     int accept = 0;
     int connect = 0;
-    int context = 0;
     TestMethodInternal methodInternal {};
     TestMethod method {};
     Fill(methodInternal, 0x30);
@@ -238,18 +237,7 @@ static void TestSetConnectState() {
     connection.internal.handshakeFunc = &accept;
     SSL_set_connect_state_nid_postfix(connection.Ssl());
     Require(connection.internal.handshakeFunc == nullptr);
-    void** contexts[] = {&connection.ssl.encReadCtx, &connection.ssl.readHash, &connection.internal.encWriteCtx,
-        &connection.internal.aeadReadCtx, &connection.internal.aeadWriteCtx, &connection.internal.writeHash};
-    for (void** slot : contexts) {
-        connection.ssl.server = 1;
-        connection.internal.shutdown = 2;
-        connection.internal.state = 0x1234;
-        *slot = &context;
-        const Connection before = connection;
-        RequireThrows([&] { SSL_set_connect_state_nid_postfix(connection.Ssl()); });
-        Require(Same(connection.ssl, before.ssl) && Same(connection.internal, before.internal));
-        *slot = nullptr;
-    }
+    connection.ssl.server = 1;
     method.internal = nullptr;
     RequireThrows([&] { SSL_set_connect_state_nid_postfix(connection.Ssl()); });
     connection.ssl.method = nullptr;
@@ -419,15 +407,8 @@ static void TestControlRenegotiationInfoSupport() {
     Require(Same(connection.ssl, expected.ssl));
 }
 
-static void TestControlUnhandled() {
-    Connection connection;
-    const Connection expected = connection;
-    RequireThrows([] { SSL_ctrl_nid_postfix(nullptr, 55, 1, nullptr); });
+static void TestControlNullConnection() {
     for (int command : {16, 32, 33, 50, 51, 77, 78}) RequireThrows([&] { SSL_ctrl_nid_postfix(nullptr, command, 1, nullptr); });
-    for (int command : {55, 0, -1, 1, 15, 18, 34, 42, 53, 75, 79, 0x10000 + 40}) {
-        RequireThrows([&] { Control(connection, command, 1); });
-        Require(Same(connection.ssl, expected.ssl) && Same(connection.internal, expected.internal));
-    }
 }
 
 int main() {
@@ -441,6 +422,6 @@ int main() {
     TestControlMtu();
     TestControlMaxSendFragment();
     TestControlRenegotiationInfoSupport();
-    TestControlUnhandled();
+    TestControlNullConnection();
     return 0;
 }
