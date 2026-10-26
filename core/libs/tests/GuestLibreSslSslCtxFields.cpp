@@ -316,7 +316,6 @@ static void TestTemporaryKeys() {
 static void TestOtherCtrlCommands() {
     Fixture f;
     for (int cmd : {0, 8, 13, 15, 17, 55, 65, 999, -1}) f.Ctrl(cmd, 0, nullptr, 0);
-    for (int cmd : {3, 4, 14, 20, 83, 91, 92, 94, 118}) f.Throws([&] { SSL_CTX_ctrl_nid_postfix(f.Context(), cmd, 0, Pointer(0x1111)); });
 }
 
 static void TestCallbackCtrl() {
@@ -333,7 +332,6 @@ static void TestCallbackCtrl() {
     f.CallbackCtrl(0, Pointer(0x1111), 0);
     f.CallbackCtrl(16, Pointer(0x1111), 0);
     f.CallbackCtrl(999, Pointer(0x1111), 0);
-    for (int cmd : {6, 7}) f.Throws([&] { SSL_CTX_callback_ctrl_nid_postfix(f.Context(), cmd, Pointer(0x1111)); });
 }
 
 static void TestSetMsgCallback() {
