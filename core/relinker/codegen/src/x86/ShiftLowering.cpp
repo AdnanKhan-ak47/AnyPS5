@@ -123,9 +123,10 @@ void EmitShift(StubBodyBuilder& body, const ShiftOperands& operands) {
     body.Raw(std::array{kPopFlags});
     if (!rotate) StackSlot(body, 0x8B, true, kCountRegister, kCountSlot);
     StackSlot(body, 0x8B, true, result, kResultSlot);
-    StackSlot(body, 0x8D, true, Stack, kFrame);
     if (operands.Destination == Stack)
-        StackSlot(body, 0x8B, operands.Wide, Stack, kStackResultSlot - kFrame);
+        StackSlot(body, 0x8B, operands.Wide, Stack, kStackResultSlot);
+    else
+        StackSlot(body, 0x8D, true, Stack, kFrame);
 }
 
 }
