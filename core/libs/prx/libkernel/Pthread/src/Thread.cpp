@@ -59,6 +59,7 @@ extern "C" bool IsInitialPthread_nid_no_patch() {
 
 static constexpr int SCE_OK = 0;
 static constexpr std::size_t GUEST_THREAD_NAME_CAPACITY = 32;
+static constexpr int GUEST_EINVAL = 22;
 
 static constexpr std::size_t HOST_STACK_MARGIN = 1u << 20;
 static constexpr int DETACH_DETACHED = 1;
@@ -499,6 +500,7 @@ PthreadPrivate::PthreadPrivate(const PthreadAttrPrivate* attr) : _finished(false
     affinity.store(attr && attr->_affinityExplicit ? attr->_affinity : inherited, std::memory_order_relaxed);
     constexpr int ExplicitSched = 0;
     const bool explicitSched = attr && attr->_inheritsched == ExplicitSched;
+    if (attr) inheritSched = attr->_inheritsched;
     const int inheritedPolicy = parent ? parent->schedPolicy.load(std::memory_order_relaxed) : schedPolicy.load(std::memory_order_relaxed);
     schedPolicy.store(explicitSched ? attr->_schedpolicy : inheritedPolicy, std::memory_order_relaxed);
     const int attrPriority = attr ? attr->_schedpriority : DEFAULT_THREAD_PRIORITY;
@@ -759,9 +761,11 @@ void ThreadCancel::CleanupRestore(void* mark) {
 }
 
 void ThreadCancel::BeginWait(TimedWait::Condition* condition) {
-    if (!CurrentGuestState().current) return;
-    std::lock_guard lock(CurrentGuestState().current->cancelLock);
-    CurrentGuestState().current->cancelWait = condition;
+    auto& state = CurrentGuestState();
+    if (!state.current) return;
+    std::lock_guard lock(state.current->cancelLock);
+    state.current->cancelWait = condition;
+    state.current->cancelWaitExiting = condition && state.exiting;
 }
 
 void ThreadCancel::EndWait() {
@@ -949,7 +953,7 @@ static unsigned __stdcall StartNativeThread(void* opaque) {
 #else
 static void* APS5_VABI RunGuestThread(void* opaque) {
     std::jmp_buf exitJump;
-    if (setjmp(exitJump) == 0) {
+    if (_setjmp(exitJump) == 0) {
         threadExitJump = &exitJump;
         RunThread(std::unique_ptr<ThreadArgs>(static_cast<ThreadArgs*>(opaque)));
     }
@@ -1022,7 +1026,10 @@ extern "C" {
 
 int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, PthreadEntry entry, void* arg, const char* name) {
     if (!thread || !entry) throw std::runtime_error("scePthreadCreate: null arg");
-    if (name && std::strlen(name) >= GUEST_THREAD_NAME_CAPACITY) return SCE_KERNEL_ERROR_ENAMETOOLONG;
+    if (name && std::strlen(name) >= GUEST_THREAD_NAME_CAPACITY) {
+        *thread = nullptr;
+        return SCE_KERNEL_ERROR_ENAMETOOLONG;
+    }
     if (attr && !*attr) attr = nullptr;
     auto p = std::make_unique<PthreadPrivate>(attr ? *attr : nullptr);
     bool detached = false;
@@ -1229,7 +1236,7 @@ void APS5_VABI scePthreadExit(void* retval) {
     _endthreadex(0);
 #else
     if (threadExitJump)
-        std::longjmp(*threadExitJump, 1);
+        _longjmp(*threadExitJump, 1);
     pthread_exit(retval);
 #endif
     throw std::runtime_error("Native thread exit returned");
@@ -1296,7 +1303,7 @@ int APS5_VABI scePthreadCancel(Pthread thread) {
     for (;;) {
         {
             std::lock_guard lock(thread->cancelLock);
-            if (!thread->cancelWait) return SCE_OK;
+            if (!thread->cancelWait || thread->cancelWaitExiting) return SCE_OK;
             thread->cancelWait->NotifyAll();
         }
         scePthreadYield();
@@ -1404,6 +1411,13 @@ void APS5_VABI scePthreadTestcancel() {
 
 int APS5_VABI scePthreadSetprio(Pthread thread, int prio) {
     if (!thread) return SCE_KERNEL_ERROR_EINVAL;
+    const auto live = LockLiveGuestThread(thread);
+    if (!live) return SCE_KERNEL_ERROR_ESRCH;
+    const auto level = static_cast<std::uint32_t>(prio) & 0xffffu;
+    if (!((level >= 256 && level <= 767) || (level >= 896 && level <= 959))) {
+        *__error_nid_postfix() = GUEST_EINVAL;
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
     thread->priority.store(prio, std::memory_order_relaxed);
     return SCE_OK;
 }
