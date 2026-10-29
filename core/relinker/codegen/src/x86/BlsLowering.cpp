@@ -126,9 +126,10 @@ void EmitBls(StubBodyBuilder& body, const BlsOperands& operands) {
     else
         Register(body, 0x8B, operands.Wide, operands.Destination, result);
     StackSlot(body, 0x8B, true, result, 0);
-    StackSlot(body, 0x8D, true, Stack, FrameSize);
     if (operands.Destination == Stack)
-        StackSlot(body, 0x8B, operands.Wide, Stack, 8 - FrameSize);
+        StackSlot(body, 0x8B, operands.Wide, Stack, 8);
+    else
+        StackSlot(body, 0x8D, true, Stack, FrameSize);
 }
 
 }
