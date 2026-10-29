@@ -88,6 +88,7 @@ constexpr int GuestSocketLevel = 0xffff;
 constexpr int GuestNonBlocking = 0x1200;
 constexpr int GuestLingerOption = 0x80;
 constexpr int GuestSendBuffer = 0x1001;
+constexpr int GuestReceiveBuffer = 0x1002;
 constexpr int WaitRounds = 5000;
 constexpr std::size_t RecordLimit = 16384;
 constexpr int CtrlMode = 33;
@@ -322,10 +323,13 @@ struct Scenario {
     const char* key = SelfKey;
     bool handshake = true;
     std::function<void(Tls&, int)> server = [](Tls&, int) {};
+    int serverReceiveBuffer = 0;
 };
 
 void Serve(const Scenario& scenario, const std::function<void(int)>& client) {
     Listener listener;
+    if (scenario.serverReceiveBuffer)
+        Require(setsockopt_nid_postfix(listener.fd, GuestSocketLevel, GuestReceiveBuffer, &scenario.serverReceiveBuffer, sizeof(int)) == 0);
     std::thread serving([&] {
         try {
             const int fd = accept_nid_postfix(listener.fd, nullptr, nullptr);
@@ -1090,6 +1094,7 @@ void TestLargeRecordSendTimeout() {
     Gate release;
     Scenario scenario;
     scenario.server = [&](Tls&, int) { release.Wait(); };
+    scenario.serverReceiveBuffer = 4096;
     Serve(scenario, [&](int fd) {
         Client client(fd);
         client.Connect();

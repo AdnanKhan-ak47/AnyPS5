@@ -62,6 +62,7 @@ constexpr int GuestSocketLevel = 0xffff;
 constexpr int GuestNonBlocking = 0x1200;
 constexpr int GuestLingerOption = 0x80;
 constexpr int GuestSendBuffer = 0x1001;
+constexpr int GuestReceiveBuffer = 0x1002;
 constexpr int WaitRounds = 5000;
 constexpr std::size_t RecordLimit = 16384;
 
@@ -200,10 +201,14 @@ struct Scenario {
     int serverVerify = LibreSslTls::SslVerifyNone;
     std::function<void(Connection&, int)> client;
     std::function<void(Connection&, int)> server = [](Connection&, int) {};
+    int serverReceiveBuffer = 0;
 };
 
 void Run(const Scenario& scenario) {
     Listener listener;
+    if (scenario.serverReceiveBuffer)
+        Require(setsockopt_nid_postfix(listener.fd, GuestSocketLevel, GuestReceiveBuffer, &scenario.serverReceiveBuffer, sizeof(int)) == 0,
+            "shrink the receive buffer the accepted socket inherits");
     std::thread serving([&] {
         try {
             const int fd = accept_nid_postfix(listener.fd, nullptr, nullptr);
@@ -902,6 +907,7 @@ void LargeRecordSendTimeout() {
     Gate release;
     Scenario scenario;
     scenario.server = [&](Connection&, int) { release.Wait("the client never opened the gate"); };
+    scenario.serverReceiveBuffer = 4096;
     scenario.client = [&](Connection& tls, int fd) {
         Require(Handshake(tls) == Result::Done, "large record handshake");
         if (FakeSocketSupport::SendTimeoutIsUnreachable(fd)) {
