@@ -24,40 +24,40 @@ static_assert(offsetof(LibreSslBio, exData) == 96);
 
 namespace {
 
-int APS5_VABI SocketWrite(LibreSslBio*, const char*, int) {
+int APS5_VABI SocketWrite_nid_no_patch(LibreSslBio*, const char*, int) {
     NotImplemented_nid_no_patch("BIO_s_socket write callback");
 }
 
-int APS5_VABI SocketRead(LibreSslBio*, char*, int) {
+int APS5_VABI SocketRead_nid_no_patch(LibreSslBio*, char*, int) {
     NotImplemented_nid_no_patch("BIO_s_socket read callback");
 }
 
-int APS5_VABI SocketPuts(LibreSslBio*, const char*) {
+int APS5_VABI SocketPuts_nid_no_patch(LibreSslBio*, const char*) {
     NotImplemented_nid_no_patch("BIO_s_socket puts callback");
 }
 
-std::int64_t APS5_VABI SocketControl(LibreSslBio*, int, std::int64_t, void*) {
+std::int64_t APS5_VABI SocketControl_nid_no_patch(LibreSslBio*, int, std::int64_t, void*) {
     NotImplemented_nid_no_patch("BIO_s_socket control callback");
 }
 
-int APS5_VABI SocketCreate(LibreSslBio*) {
+int APS5_VABI SocketCreate_nid_no_patch(LibreSslBio*) {
     NotImplemented_nid_no_patch("BIO_s_socket create callback");
 }
 
-int APS5_VABI SocketDestroy(LibreSslBio*) {
+int APS5_VABI SocketDestroy_nid_no_patch(LibreSslBio*) {
     NotImplemented_nid_no_patch("BIO_s_socket destroy callback");
 }
 
 const LibreSslBioMethod socketMethod{
     SslLayout::BioTypeSocket,
     "socket",
-    reinterpret_cast<void*>(SocketWrite),
-    reinterpret_cast<void*>(SocketRead),
-    reinterpret_cast<void*>(SocketPuts),
+    reinterpret_cast<void*>(SocketWrite_nid_no_patch),
+    reinterpret_cast<void*>(SocketRead_nid_no_patch),
+    reinterpret_cast<void*>(SocketPuts_nid_no_patch),
     nullptr,
-    reinterpret_cast<void*>(SocketControl),
-    reinterpret_cast<void*>(SocketCreate),
-    reinterpret_cast<void*>(SocketDestroy),
+    reinterpret_cast<void*>(SocketControl_nid_no_patch),
+    reinterpret_cast<void*>(SocketCreate_nid_no_patch),
+    reinterpret_cast<void*>(SocketDestroy_nid_no_patch),
     nullptr};
 
 void FreeBio(LibreSslBio* bio) {
