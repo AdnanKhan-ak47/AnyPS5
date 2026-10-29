@@ -150,9 +150,10 @@ void EmitBitfield(StubBodyBuilder& body, const BitfieldOperands& operands) {
     StackSlot(body, 0x8B, true, mask, kMaskSlot);
     StackSlot(body, 0x8B, true, kControlRegister, kControlSlot);
     StackSlot(body, 0x8B, true, result, kResultSlot);
-    StackSlot(body, 0x8D, true, Stack, kFrame);
     if (operands.Destination == Stack)
-        StackSlot(body, 0x8B, operands.Wide, Stack, kStackResultSlot - kFrame);
+        StackSlot(body, 0x8B, operands.Wide, Stack, kStackResultSlot);
+    else
+        StackSlot(body, 0x8D, true, Stack, kFrame);
 }
 
 }
