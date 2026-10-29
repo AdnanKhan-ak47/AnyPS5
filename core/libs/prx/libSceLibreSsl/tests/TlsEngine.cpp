@@ -1,7 +1,10 @@
 #include "prx/libSceLibreSsl/include/TlsEngine.hpp"
+#include "prx/libSceLibreSsl/tests/FakeSocket.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #ifndef _WIN32
 #include <cerrno>
+#include <csignal>
+#include <pthread.h>
 #endif
 
 #include <mbedtls/x509.h>
@@ -162,6 +165,22 @@ void MakeNonBlocking(int fd) {
     Require(setsockopt_nid_postfix(fd, GuestSocketLevel, GuestNonBlocking, &enabled, sizeof(enabled)) == 0, "make the socket non-blocking");
 }
 
+using Clock = std::chrono::steady_clock;
+using FakeSocketSupport::FakeDescriptor;
+using FakeSocketSupport::GuestReceiveTimeout;
+using FakeSocketSupport::GuestSendTimeout;
+using FakeSocketSupport::HostBadDescriptorCode;
+using FakeSocketSupport::HostInterruptedCode;
+using FakeSocketSupport::HostWouldBlockCode;
+using FakeSocketSupport::InstallFake;
+using FakeSocketSupport::RemoveFake;
+
+void SetTimeout(int fd, int option, int milliseconds) { FakeSocketSupport::SetSocketTimeout(fd, option, milliseconds); }
+
+long ElapsedMilliseconds(Clock::time_point since) {
+    return static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since).count());
+}
+
 struct Gate {
     std::atomic<bool> open{false};
 
@@ -288,7 +307,7 @@ void UntrustedHandshake() {
         Require(!tls.SentShutdown() && !tls.ReceivedShutdown(), "no shutdown happened yet");
         RequireThrows<std::logic_error>([&] { tls.SetHostname("late.example"); }, "the host name changed after the handshake");
         RequireThrows<std::logic_error>([&] { tls.SetVerifyMode(0); }, "the verify mode changed after the handshake");
-        RequireThrows<std::logic_error>([&] { tls.SetSocket(2); }, "the socket changed after the handshake");
+        RequireThrows<std::invalid_argument>([&] { tls.SetSocket(2); }, "a descriptor that is not a guest socket was accepted after the handshake");
         RequireThrows<std::logic_error>([&] { TrustServer(tls); }, "trust anchors changed after the handshake");
     };
     Run(scenario);
@@ -749,31 +768,342 @@ void AbruptClose() {
     Run(reset);
 }
 
+void BlockingTransport() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Connection& tls, int) {
+        release.Wait("the client never opened the gate");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        WriteAll(tls, "late", 4);
+        std::uint8_t byte = 0;
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Read(&byte, 1, transferred, false); }) == Result::ZeroReturn, "BlockingTransport: wait for the client's close");
+    };
+    scenario.client = [&](Connection& tls, int) {
+        Require(tls.Handshake() == Result::Done, "a blocking socket finishes the handshake in one call");
+        release.Open();
+        std::array<char, 8> out{};
+        std::size_t transferred = 0;
+        const auto start = Clock::now();
+        Require(tls.Read(out.data(), out.size(), transferred, false) == Result::Done && transferred == 4 && std::memcmp(out.data(), "late", 4) == 0,
+            "a blocking read returns the data once it arrives");
+        Require(ElapsedMilliseconds(start) >= 150, "a blocking read waited for the peer instead of returning at once");
+        bool complete = false;
+        Require(Retry([&] { return tls.Shutdown(complete); }) == Result::Done, "close the blocking connection");
+    };
+    Run(scenario);
 }
 
-int main() {
+void NonBlockingTransport() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Connection& tls, int) {
+        release.Wait("the client never opened the gate");
+        WriteAll(tls, "now", 3);
+        std::uint8_t byte = 0;
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Read(&byte, 1, transferred, false); }) == Result::ZeroReturn, "NonBlockingTransport: wait for the client's close");
+    };
+    scenario.client = [&](Connection& tls, int fd) {
+        MakeNonBlocking(fd);
+        SetTimeout(fd, GuestReceiveTimeout, 3000);
+        SetTimeout(fd, GuestSendTimeout, 3000);
+        Require(Handshake(tls) == Result::Done, "non-blocking handshake");
+        std::array<char, 8> out{};
+        std::size_t transferred = 0;
+        const auto start = Clock::now();
+        Require(tls.Read(out.data(), out.size(), transferred, false) == Result::WantRead && transferred == 0, "a non-blocking read wants a read");
+        Require(ElapsedMilliseconds(start) < 1500, "a non-blocking read must ignore SO_RCVTIMEO and return at once");
+        Require(tls.SystemError() == HostWouldBlockCode, "the would-block errno is reported");
+        release.Open();
+        Require(Retry([&] { return tls.Read(out.data(), out.size(), transferred, false); }) == Result::Done && transferred == 3, "the data after the gate");
+        bool complete = false;
+        Require(Retry([&] { return tls.Shutdown(complete); }) == Result::Done, "close the non-blocking connection");
+    };
+    Run(scenario);
+}
+
+void ReceiveTimeout() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Connection& tls, int) {
+        release.Wait("the client never opened the gate");
+        WriteAll(tls, "after", 5);
+        std::uint8_t byte = 0;
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Read(&byte, 1, transferred, false); }) == Result::ZeroReturn, "ReceiveTimeout: wait for the client's close");
+    };
+    scenario.client = [&](Connection& tls, int fd) {
+        Require(Handshake(tls) == Result::Done, "timeout handshake");
+        SetTimeout(fd, GuestReceiveTimeout, 250);
+        std::array<char, 8> out{};
+        std::size_t transferred = 3;
+        const auto start = Clock::now();
+        Require(tls.Read(out.data(), out.size(), transferred, false) == Result::WantRead && transferred == 0, "an expired receive timeout wants a read");
+        const long waited = ElapsedMilliseconds(start);
+        Require(waited >= 200 && waited < 5000, "the read waited for the receive timeout");
+        Require(tls.SystemError() == HostWouldBlockCode, "an expired receive timeout is reported as would-block");
+        Require(tls.LastDirection() == LibreSslTls::Direction::Read, "the timed out transfer was a read");
+        release.Open();
+        Require(Retry([&] { return tls.Read(out.data(), out.size(), transferred, false); }) == Result::Done && transferred == 5, "the read resumes after a timeout");
+        bool complete = false;
+        Require(Retry([&] { return tls.Shutdown(complete); }) == Result::Done, "close the connection");
+    };
+    Run(scenario);
+}
+
+void SendTimeout() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Connection&, int) { release.Wait("the client never opened the gate"); };
+    scenario.client = [&](Connection& tls, int fd) {
+        Require(Handshake(tls) == Result::Done, "send timeout handshake");
+        if (FakeSocketSupport::SendTimeoutIsUnreachable(fd)) {
+            release.Open();
+            return;
+        }
+        SetTimeout(fd, GuestSendTimeout, 250);
+        const auto chunk = Pattern(100, 9);
+        std::size_t transferred = 0;
+        long waited = 0;
+        Result result = Result::Done;
+        for (int round = 0; round < 400000 && result == Result::Done; ++round) {
+            const auto start = Clock::now();
+            result = tls.Write(chunk.data(), chunk.size(), transferred);
+            waited = ElapsedMilliseconds(start);
+        }
+        Require(result == Result::WantWrite && transferred == 0, "a full send buffer with an expired send timeout wants a write");
+        Require(waited >= 200 && waited < 5000, "the write waited for the send timeout");
+        Require(tls.SystemError() == HostWouldBlockCode, "an expired send timeout is reported as would-block");
+        Require(tls.LastDirection() == LibreSslTls::Direction::Write, "the timed out transfer was a write");
+        release.Open();
+    };
+    Run(scenario);
+}
+
+#ifndef _WIN32
+void IgnoreSignal(int) {}
+
+void SignalInterruptsBlockingRead() {
+    struct sigaction action {};
+    action.sa_handler = IgnoreSignal;
+    sigemptyset(&action.sa_mask);
+    struct sigaction previous {};
+    Require(sigaction(SIGUSR2, &action, &previous) == 0, "install the signal handler without SA_RESTART");
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Connection& tls, int) {
+        release.Wait("the client never opened the gate");
+        WriteAll(tls, "after", 5);
+        std::uint8_t byte = 0;
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Read(&byte, 1, transferred, false); }) == Result::ZeroReturn, "SignalInterruptsBlockingRead: wait for the client's close");
+    };
+    scenario.client = [&](Connection& tls, int fd) {
+        Require(Handshake(tls) == Result::Done, "signal handshake");
+        std::array<char, 8> out{};
+        std::size_t transferred = 0;
+        if (!FakeSocketSupport::OwnerProvidesTransfer(fd)) {
+            const pthread_t reader = pthread_self();
+            std::thread sender([reader] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                pthread_kill(reader, SIGUSR2);
+            });
+            const auto start = Clock::now();
+            const Result result = tls.Read(out.data(), out.size(), transferred, false);
+            const long waited = ElapsedMilliseconds(start);
+            sender.join();
+            Require(result == Result::WantRead && transferred == 0, "a signal interrupting a blocked read wants a read");
+            Require(waited >= 150 && waited < 5000, "the read returned when the signal arrived");
+            Require(tls.SystemError() == EINTR && tls.LastDirection() == LibreSslTls::Direction::Read, "the interruption is visible as errno EINTR");
+        }
+        release.Open();
+        Require(Retry([&] { return tls.Read(out.data(), out.size(), transferred, false); }) == Result::Done && transferred == 5, "the read resumes after the interruption");
+        bool complete = false;
+        Require(Retry([&] { return tls.Shutdown(complete); }) == Result::Done, "close the connection");
+    };
+    Run(scenario);
+    Require(sigaction(SIGUSR2, &previous, nullptr) == 0, "restore the signal handler");
+}
+#endif
+
+void ConsultsNativeOwnerTransfer() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Connection& tls, int) {
+        release.Wait("the client never opened the gate");
+        WriteAll(tls, "one", 3);
+        release.open = false;
+        release.Wait("the client never reopened the gate");
+        WriteAll(tls, "two", 3);
+        std::array<std::uint8_t, 4> ping{};
+        ReadExact(tls, ping.data(), ping.size());
+        Require(std::memcmp(ping.data(), "ping", 4) == 0, "the interrupted write delivered its bytes once");
+        std::uint8_t byte = 0;
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Read(&byte, 1, transferred, false); }) == Result::ZeroReturn, "ConsultsNativeOwnerTransfer: wait for the client's close");
+    };
+    scenario.client = [&](Connection& tls, int fd) {
+        const auto fake = InstallFake(fd);
+        tls.SetSocket(FakeDescriptor);
+        Require(Handshake(tls) == Result::Done, "handshake through the owner's transfer");
+        Require(fake->calls > 0 && fake->sendCalls > 0, "the engine moved the handshake through NativeOwner::transfer, not the raw socket");
+        std::array<char, 8> out{};
+        std::size_t transferred = 0;
+        release.Open();
+        Require(Retry([&] { return tls.Read(out.data(), out.size(), transferred, false); }) == Result::Done && transferred == 3, "the first read");
+        const int callsAfterFirstRead = fake->calls;
+        release.open = false;
+
+        fake->failNext = HostInterruptedCode;
+        transferred = 1;
+        Require(tls.Read(out.data(), out.size(), transferred, false) == Result::WantRead && transferred == 0, "an interrupted receive wants a read, as a retryable BIO error does");
+        Require(tls.SystemError() == HostInterruptedCode && tls.LastDirection() == LibreSslTls::Direction::Read, "the interruption is visible as errno EINTR");
+        Require(fake->calls > callsAfterFirstRead, "the interrupted read went through the owner's transfer");
+        fake->failNext = HostWouldBlockCode;
+        Require(tls.Read(out.data(), out.size(), transferred, false) == Result::WantRead && tls.SystemError() == HostWouldBlockCode, "a timeout from the transfer wants a read");
+
+        fake->failNext = HostInterruptedCode;
+        const std::array<char, 4> payload{'p', 'i', 'n', 'g'};
+        Require(tls.Write(payload.data(), payload.size(), transferred) == Result::WantWrite && transferred == 0, "an interrupted send wants a write");
+        Require(tls.SystemError() == HostInterruptedCode && tls.LastDirection() == LibreSslTls::Direction::Write, "the interrupted send is visible as errno EINTR");
+        Require(Retry([&] { return tls.Write(payload.data(), payload.size(), transferred); }) == Result::Done && transferred == payload.size(), "the interrupted write completes when retried");
+
+        release.Open();
+        Require(Retry([&] { return tls.Read(out.data(), out.size(), transferred, false); }) == Result::Done && transferred == 3 && std::memcmp(out.data(), "two", 3) == 0,
+            "the read completes when retried");
+        bool complete = false;
+        Require(Retry([&] { return tls.Shutdown(complete); }) == Result::Done, "close the connection");
+        tls.DetachSocket();
+        RemoveFake();
+    };
+    Run(scenario);
+}
+
+void ClosedDescriptor() {
+    Gate closed;
+    Scenario scenario;
+    scenario.server = [&](Connection& tls, int) {
+        closed.Wait("the client never closed its socket");
+        std::uint8_t byte = 0;
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Read(&byte, 1, transferred, false); }) == Result::Syscall && !tls.ReceivedShutdown(),
+            "closing the guest descriptor must close the connection, not leave the engine holding it open");
+    };
+    scenario.client = [&](Connection& tls, int fd) {
+        Require(Handshake(tls) == Result::Done, "close handshake");
+        Require(close_nid_postfix(fd) == 0, "close the guest descriptor under the connection");
+        closed.Open();
+        std::array<char, 8> out{};
+        std::size_t transferred = 3;
+        Require(tls.Read(out.data(), out.size(), transferred, false) == Result::Syscall && transferred == 0, "a read on a closed descriptor is a syscall error");
+        Require(tls.SystemError() == HostBadDescriptorCode, "a read on a closed descriptor reports EBADF");
+        Require(tls.Write(out.data(), 1, transferred) == Result::Syscall && tls.SystemError() == HostBadDescriptorCode, "a write on a closed descriptor reports EBADF");
+        Require(tls.LastDirection() == LibreSslTls::Direction::Write, "the failing transfer was a write");
+    };
+    Run(scenario);
+}
+
+void ReassignedSocket() {
+    Gate release;
+    Gate checked;
+    Scenario scenario;
+    scenario.server = [&](Connection& tls, int fd) {
+        release.Wait("the client never moved to the second socket");
+        MakeNonBlocking(fd);
+        std::uint8_t byte = 0;
+        std::size_t transferred = 5;
+        Require(tls.Read(&byte, 1, transferred, false) == Result::WantRead && transferred == 0, "nothing reached the first socket after the switch");
+        checked.Open();
+    };
+    scenario.client = [&](Connection& tls, int first) {
+        Listener other;
+        const int second = ConnectTo(other.port);
+        const int peer = accept_nid_postfix(other.fd, nullptr, nullptr);
+        Require(peer >= 0, "accept the second connection");
+        MakeNonBlocking(peer);
+        Require(Handshake(tls) == Result::Done, "handshake on the first socket");
+        Require(tls.Socket() == first, "the connection reports the first socket");
+        const std::uint64_t sentBefore = tls.BytesSent();
+
+        RequireThrows<std::invalid_argument>([&] { tls.SetSocket(1 << 20); }, "switching to a descriptor that is not a guest socket was accepted");
+        Require(tls.Socket() == first, "a rejected switch kept the first socket");
+        tls.SetSocket(second);
+        Require(tls.Socket() == second, "the connection reports the second socket");
+
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Write("hello", 5, transferred); }) == Result::Done && transferred == 5, "write after switching sockets");
+        std::array<std::uint8_t, 128> wire{};
+        std::int64_t received = -1;
+        for (int round = 0; round < WaitRounds && received <= 0; ++round) {
+            received = recv_nid_postfix(peer, wire.data(), wire.size(), 0);
+            if (received <= 0) Settle();
+        }
+        Require(received > 5 && wire[0] == 0x17 && wire[1] == 0x03 && wire[2] == 0x03, "the record went out on the second socket");
+        Require(tls.BytesSent() == sentBefore + static_cast<std::uint64_t>(received), "the byte counter follows the second socket");
+        release.Open();
+        checked.Wait("the server never checked the first socket");
+
+        tls.DetachSocket();
+        Require(tls.Socket() == -1, "a detached connection has no socket");
+        std::array<char, 8> out{};
+        Require(tls.Read(out.data(), out.size(), transferred, false) == Result::Syscall && tls.SystemError() == HostBadDescriptorCode, "a detached connection reads EBADF");
+        close_nid_postfix(second);
+        close_nid_postfix(peer);
+    };
+    Run(scenario);
+}
+
+}
+
+int main(int argc, char** argv) {
+    const std::string group = argc > 1 ? argv[1] : "all";
+    const bool all = group == "all";
+    const bool handshake = all || group == "handshake";
+    const bool data = all || group == "data";
+    const bool transport = all || group == "transport";
+    if (!handshake && !data && !transport) {
+        std::fprintf(stderr, "unknown test group %s\n", group.c_str());
+        return 2;
+    }
     try {
-        ResultCodes();
-        NotASocket();
-        BadIdentity();
-        UntrustedHandshake();
-        TrustedHandshake();
-        WrongHostname();
-        NoHostname();
-        VerifyPeerClient();
-        ClientCertificate();
-        ServerWithoutCertificate();
-        EofDuringHandshake();
-        RoundTrip();
-        PeekAndPending();
-        ZeroLengthOperations();
-        NonBlockingRead();
-        WriteBackPressure();
-        Shutdown();
-        ShutdownBeforeHandshake();
-        AbruptClose();
-        ServerNameOnly();
-        WriteOptions();
+        if (handshake) {
+            ResultCodes();
+            NotASocket();
+            BadIdentity();
+            UntrustedHandshake();
+            TrustedHandshake();
+            WrongHostname();
+            NoHostname();
+            VerifyPeerClient();
+            ClientCertificate();
+            ServerWithoutCertificate();
+            EofDuringHandshake();
+            ServerNameOnly();
+        }
+        if (data) {
+            RoundTrip();
+            PeekAndPending();
+            ZeroLengthOperations();
+            WriteOptions();
+            Shutdown();
+            ShutdownBeforeHandshake();
+            AbruptClose();
+        }
+        if (transport) {
+            NonBlockingRead();
+            WriteBackPressure();
+            BlockingTransport();
+            NonBlockingTransport();
+            ReceiveTimeout();
+            SendTimeout();
+#ifndef _WIN32
+            SignalInterruptsBlockingRead();
+#endif
+            ConsultsNativeOwnerTransfer();
+            ClosedDescriptor();
+            ReassignedSocket();
+        }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "failed: %s\n", error.what());
         return 1;

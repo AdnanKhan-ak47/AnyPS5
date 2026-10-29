@@ -1,7 +1,9 @@
 #include "prx/libSceLibreSsl/include/TlsEngine.hpp"
+#include "prx/libkernel/include/Api.hpp"
 #ifdef _WIN32
 #include <winsock2.h>
 #else
+#include <poll.h>
 #include <sys/socket.h>
 #include <cerrno>
 #endif
@@ -60,6 +62,79 @@ bool HostReset(int error) {
 #endif
 }
 
+void SetHostError(int error) {
+#ifdef _WIN32
+    WSASetLastError(error);
+#else
+    errno = error;
+#endif
+}
+
+constexpr int HostBadDescriptor =
+#ifdef _WIN32
+    WSAEBADF;
+#else
+    EBADF;
+#endif
+
+constexpr int HostWouldBlockError =
+#ifdef _WIN32
+    WSAEWOULDBLOCK;
+#else
+    EAGAIN;
+#endif
+
+constexpr int GuestSocketLevel = 0xffff;
+constexpr int GuestSendTimeout = 0x1005;
+constexpr int GuestReceiveTimeout = 0x1006;
+constexpr int GuestGetStatusFlags = 3;
+constexpr int GuestNonBlockingFlag = 4;
+
+struct GuestTimeval {
+    std::int64_t seconds;
+    std::int64_t microseconds;
+};
+
+bool GuestNonBlocking(int guestFd) {
+    const int flags = fcntl_nid_postfix(guestFd, GuestGetStatusFlags);
+    return flags >= 0 && (flags & GuestNonBlockingFlag) != 0;
+}
+
+int GuestTimeoutMilliseconds(int guestFd, bool send) {
+    GuestTimeval time{};
+    std::uint32_t length = sizeof(time);
+    if (getsockopt_nid_postfix(guestFd, GuestSocketLevel, send ? GuestSendTimeout : GuestReceiveTimeout, &time, &length) != 0 || length != sizeof(time)) return 0;
+    if (time.seconds <= 0 && time.microseconds <= 0) return 0;
+    const std::int64_t milliseconds = time.seconds * 1000 + (time.microseconds + 999) / 1000;
+    return static_cast<int>(std::clamp<std::int64_t>(milliseconds, 1, INT_MAX));
+}
+
+std::int64_t NativeTransfer(int guestFd, std::uintptr_t native, bool send, void* buffer, int chunk) {
+    if (!GuestNonBlocking(guestFd)) {
+        if (const int milliseconds = GuestTimeoutMilliseconds(guestFd, send)) {
+#ifdef _WIN32
+            WSAPOLLFD ready{static_cast<SOCKET>(native), static_cast<SHORT>(send ? POLLWRNORM : POLLRDNORM), 0};
+            const int waited = WSAPoll(&ready, 1, milliseconds);
+#else
+            pollfd ready{static_cast<int>(native), static_cast<short>(send ? POLLOUT : POLLIN), 0};
+            const int waited = ::poll(&ready, 1, milliseconds);
+#endif
+            if (waited < 0) return -1;
+            if (waited == 0) {
+                SetHostError(HostWouldBlockError);
+                return -1;
+            }
+        }
+    }
+#ifdef _WIN32
+    return send ? ::send(static_cast<SOCKET>(native), static_cast<const char*>(buffer), chunk, 0)
+                : ::recv(static_cast<SOCKET>(native), static_cast<char*>(buffer), chunk, 0);
+#else
+    return send ? ::send(static_cast<int>(native), buffer, static_cast<std::size_t>(chunk), MSG_NOSIGNAL)
+                : ::recv(static_cast<int>(native), buffer, static_cast<std::size_t>(chunk), 0);
+#endif
+}
+
 bool HostTimedOut(int error) {
 #ifdef _WIN32
     return error == WSAETIMEDOUT;
@@ -104,8 +179,7 @@ struct Connection::State {
 
     bool server;
     int guestFd = -1;
-    std::shared_ptr<void> owner;
-    std::uintptr_t native = 0;
+    bool socketBound = false;
     int hostError = 0;
     int verifyMode = SslVerifyNone;
     std::string hostname;
@@ -195,29 +269,31 @@ struct Connection::State {
         prepared = true;
     }
 
+    std::int64_t Transfer(bool send, unsigned char* buffer, int chunk) {
+        std::shared_ptr<void> owner;
+        std::uintptr_t native = 0;
+        if (guestFd < 0 || !KernelLookupSocketNative_nid_no_patch(guestFd, &owner, &native)) {
+            SetHostError(HostBadDescriptor);
+            return -1;
+        }
+        auto* socket = static_cast<KernelSocketPoll::NativeOwner*>(owner.get());
+        if (socket && socket->transfer) return socket->transfer(socket, send, buffer, chunk);
+        return NativeTransfer(guestFd, native, send, buffer, chunk);
+    }
+
     static int Send(void* argument, const unsigned char* buffer, std::size_t length) {
         auto& self = *static_cast<State*>(argument);
         const auto chunk = static_cast<int>(std::min<std::size_t>(length, INT_MAX));
         self.hostError = 0;
-        for (;;) {
-#ifdef _WIN32
-            auto* owner = static_cast<KernelSocketPoll::NativeOwner*>(self.owner.get());
-            const auto sent = owner && owner->transfer
-                ? owner->transfer(owner, true, const_cast<unsigned char*>(buffer), chunk)
-                : ::send(static_cast<SOCKET>(self.native), reinterpret_cast<const char*>(buffer), chunk, 0);
-#else
-            const auto sent = ::send(static_cast<int>(self.native), buffer, static_cast<std::size_t>(chunk), MSG_NOSIGNAL);
-#endif
-            if (sent > 0) self.sentTotal += static_cast<std::uint64_t>(sent);
-            if (sent >= 0) return static_cast<int>(sent);
-            self.direction = Direction::Write;
-            const int error = HostError();
-            if (HostInterrupted(error)) continue;
-            self.hostError = error;
-            if (HostWouldBlock(error) || HostTimedOut(error)) return MBEDTLS_ERR_SSL_WANT_WRITE;
-            if (HostReset(error)) return MBEDTLS_ERR_NET_CONN_RESET;
-            return MBEDTLS_ERR_NET_SEND_FAILED;
-        }
+        const auto sent = self.Transfer(true, const_cast<unsigned char*>(buffer), chunk);
+        if (sent > 0) self.sentTotal += static_cast<std::uint64_t>(sent);
+        if (sent >= 0) return static_cast<int>(sent);
+        self.direction = Direction::Write;
+        const int error = HostError();
+        self.hostError = error;
+        if (HostInterrupted(error) || HostWouldBlock(error) || HostTimedOut(error)) return MBEDTLS_ERR_SSL_WANT_WRITE;
+        if (HostReset(error)) return MBEDTLS_ERR_NET_CONN_RESET;
+        return MBEDTLS_ERR_NET_SEND_FAILED;
     }
 
     static int Verify(void* argument, mbedtls_x509_crt* certificate, int depth, std::uint32_t* flags) {
@@ -239,28 +315,18 @@ struct Connection::State {
         auto& self = *static_cast<State*>(argument);
         const auto chunk = static_cast<int>(std::min<std::size_t>(length, INT_MAX));
         self.hostError = 0;
-        for (;;) {
-#ifdef _WIN32
-            auto* owner = static_cast<KernelSocketPoll::NativeOwner*>(self.owner.get());
-            const auto received = owner && owner->transfer
-                ? owner->transfer(owner, false, buffer, chunk)
-                : ::recv(static_cast<SOCKET>(self.native), reinterpret_cast<char*>(buffer), chunk, 0);
-#else
-            const auto received = ::recv(static_cast<int>(self.native), buffer, static_cast<std::size_t>(chunk), 0);
-#endif
-            if (received > 0) {
-                self.receivedTotal += static_cast<std::uint64_t>(received);
-                return static_cast<int>(received);
-            }
-            self.direction = Direction::Read;
-            if (received == 0) return 0;
-            const int error = HostError();
-            if (HostInterrupted(error)) continue;
-            self.hostError = error;
-            if (HostWouldBlock(error) || HostTimedOut(error)) return MBEDTLS_ERR_SSL_WANT_READ;
-            if (HostReset(error)) return MBEDTLS_ERR_NET_CONN_RESET;
-            return MBEDTLS_ERR_NET_RECV_FAILED;
+        const auto received = self.Transfer(false, buffer, chunk);
+        if (received > 0) {
+            self.receivedTotal += static_cast<std::uint64_t>(received);
+            return static_cast<int>(received);
         }
+        self.direction = Direction::Read;
+        if (received == 0) return 0;
+        const int error = HostError();
+        self.hostError = error;
+        if (HostInterrupted(error) || HostWouldBlock(error) || HostTimedOut(error)) return MBEDTLS_ERR_SSL_WANT_READ;
+        if (HostReset(error)) return MBEDTLS_ERR_NET_CONN_RESET;
+        return MBEDTLS_ERR_NET_RECV_FAILED;
     }
 
     Result Classify(int code) {
@@ -302,7 +368,7 @@ struct Connection::State {
 
     Result Establish() {
         if (handshaken) return Result::Done;
-        if (guestFd < 0) return Failed(Failure::Other, 0);
+        if (!socketBound) return Failed(Failure::Other, 0);
         Prepare();
         const int code = mbedtls_ssl_handshake(&ssl);
         if (code == 0) {
@@ -337,14 +403,17 @@ Connection::Connection(bool server) : state(std::make_unique<State>(server)) { s
 Connection::~Connection() = default;
 
 void Connection::SetSocket(int guestFd) {
-    state->RequireUnstarted("SetSocket");
     std::shared_ptr<void> owner;
     std::uintptr_t native = 0;
     if (!KernelLookupSocketNative_nid_no_patch(guestFd, &owner, &native))
         throw std::invalid_argument("LibreSSL TLS engine: descriptor " + std::to_string(guestFd) + " is not a guest socket");
-    state->owner = std::move(owner);
-    state->native = native;
     state->guestFd = guestFd;
+    state->socketBound = true;
+}
+
+void Connection::DetachSocket() {
+    state->guestFd = -1;
+    state->socketBound = true;
 }
 
 int Connection::Socket() const { return state->guestFd; }

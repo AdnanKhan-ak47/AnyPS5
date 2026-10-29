@@ -345,6 +345,20 @@ bool Wait(LibreSslSslInternal& internal, LibreSslBio& bio, EngineResult result, 
     return true;
 }
 
+void FollowDescriptor(LibreSslBio& bio, Tls& tls) {
+    const int descriptor = LibreSslBioDescriptor_nid_no_patch(&bio);
+    if (descriptor == tls.Socket()) return;
+    if (descriptor < 0) {
+        tls.DetachSocket();
+        return;
+    }
+    try {
+        tls.SetSocket(descriptor);
+    } catch (const std::invalid_argument&) {
+        tls.DetachSocket();
+    }
+}
+
 void Succeeded(LibreSslSslInternal& internal, LibreSslBio& bio) {
     internal.rwstate = RwNothing;
     SetRetry(bio, 0);
@@ -485,6 +499,7 @@ int Handshake(LibreSsl& ssl, bool server, const char* function) {
         Unmodelled(function, "continuing a handshake that already failed");
     }
     LibreSslBio& bio = SharedBio(ssl, function);
+    FollowDescriptor(bio, *session->tls);
     const EngineResult result = session->tls->Handshake();
     Account(bio, *session);
     if (Wait(internal, bio, result, *session->tls)) return -1;
@@ -537,6 +552,7 @@ int ReadApplicationData(LibreSsl& ssl, void* buffer, int length, bool peek, cons
     }
     Session& session = Established(ssl, function);
     LibreSslBio& bio = SharedBio(ssl, function);
+    FollowDescriptor(bio, *session.tls);
     std::size_t transferred = 0;
     const EngineResult result = session.tls->Read(buffer, static_cast<std::size_t>(length), transferred, peek);
     Account(bio, session);
@@ -613,6 +629,7 @@ int APS5_VABI LibreSslWrite_nid_no_patch(LibreSsl* ssl, const void* buffer, int 
     }
     Session& session = Established(connection, function);
     LibreSslBio& bio = SharedBio(connection, function);
+    FollowDescriptor(bio, *session.tls);
     LibreSslTls::WriteOptions options;
     options.fragment = connection.maxSendFragment;
     options.partial = (internal.mode & ModeEnablePartialWrite) != 0;
@@ -653,6 +670,7 @@ int APS5_VABI LibreSslShutdown_nid_no_patch(LibreSsl* ssl) {
     }
     Session& session = Established(connection, function);
     LibreSslBio& bio = SharedBio(connection, function);
+    FollowDescriptor(bio, *session.tls);
     bool complete = false;
     const EngineResult result = session.tls->Shutdown(complete);
     Account(bio, session);

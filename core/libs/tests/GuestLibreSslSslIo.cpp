@@ -2,6 +2,7 @@
 #include "prx/libSceLibreSsl/include/Error.hpp"
 #include "prx/libSceLibreSsl/include/SslInternal.hpp"
 #include "prx/libSceLibreSsl/include/TlsEngine.hpp"
+#include "prx/libSceLibreSsl/tests/FakeSocket.hpp"
 #include "prx/libc/include/Api.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
@@ -287,6 +288,21 @@ void ResetOnClose(int fd) {
         std::int32_t seconds;
     } linger{1, 0};
     Require(setsockopt_nid_postfix(fd, GuestSocketLevel, GuestLingerOption, &linger, sizeof(linger)) == 0);
+}
+
+using Clock = std::chrono::steady_clock;
+using FakeSocketSupport::FakeDescriptor;
+using FakeSocketSupport::GuestReceiveTimeout;
+using FakeSocketSupport::GuestSendTimeout;
+using FakeSocketSupport::InstallFake;
+using FakeSocketSupport::RemoveFake;
+using FakeSocketSupport::SetSocketTimeout;
+
+constexpr int GuestInterruptedCode = 4;
+constexpr int GuestBadDescriptorCode = 9;
+
+long ElapsedMilliseconds(Clock::time_point since) {
+    return static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since).count());
 }
 
 struct Gate {
@@ -951,25 +967,288 @@ void TestAcceptWithoutCertificateFailsLikeLibreSsl() {
         });
 }
 
+
+void TestBlockingSocketWaitsForData() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Tls& tls, int) {
+        release.Wait();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        WriteAll(tls, "late", 4);
+        std::uint8_t byte = 0;
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Read(&byte, 1, transferred, false); }) == EngineResult::ZeroReturn);
+    };
+    Serve(scenario, [&](int fd) {
+        Client client(fd);
+        client.Connect();
+        release.Open();
+        std::uint8_t buffer[8];
+        const auto start = Clock::now();
+        Require(SSL_read_nid_postfix(client.ssl, buffer, sizeof(buffer)) == 4 && std::memcmp(buffer, "late", 4) == 0);
+        Require(ElapsedMilliseconds(start) >= 150);
+        Require(SSL_want_nid_postfix(client.ssl) == RwNothing && client.Bio().flags == 0);
+        Require(SSL_shutdown_nid_postfix(client.ssl) == 0);
+    });
 }
 
-int main() {
+void TestNonBlockingSocketIgnoresTimeouts() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Tls& tls, int) {
+        release.Wait();
+        std::uint8_t byte = 0;
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Read(&byte, 1, transferred, false); }) == EngineResult::Done);
+    };
+    Serve(scenario, [&](int fd) {
+        MakeNonBlocking(fd);
+        SetSocketTimeout(fd, GuestReceiveTimeout, 3000);
+        SetSocketTimeout(fd, GuestSendTimeout, 3000);
+        Client client(fd);
+        client.NameHost();
+        for (int round = 0; SSL_connect_nid_postfix(client.ssl) != 1; ++round) {
+            Require(round < WaitRounds);
+            Settle();
+        }
+        std::uint8_t buffer[8];
+        const auto start = Clock::now();
+        Require(SSL_read_nid_postfix(client.ssl, buffer, sizeof(buffer)) == -1);
+        Require(SSL_get_error_nid_postfix(client.ssl, -1) == SslErrorWantRead && *__error_nid_postfix() == WouldBlockCode());
+        Require(ElapsedMilliseconds(start) < 1500);
+        release.Open();
+        const std::uint8_t byte = 1;
+        Require(SSL_write_nid_postfix(client.ssl, &byte, 1) == 1);
+    });
+}
+
+void TestReceiveTimeout() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Tls& tls, int) {
+        release.Wait();
+        WriteAll(tls, "after", 5);
+        std::uint8_t byte = 0;
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Read(&byte, 1, transferred, false); }) == EngineResult::ZeroReturn);
+    };
+    Serve(scenario, [&](int fd) {
+        Client client(fd);
+        client.Connect();
+        SetSocketTimeout(fd, GuestReceiveTimeout, 250);
+        std::uint8_t buffer[8];
+        const auto start = Clock::now();
+        Require(SSL_read_nid_postfix(client.ssl, buffer, sizeof(buffer)) == -1);
+        const long waited = ElapsedMilliseconds(start);
+        Require(waited >= 200 && waited < 5000);
+        Require(SSL_get_error_nid_postfix(client.ssl, -1) == SslErrorWantRead);
+        Require(*__error_nid_postfix() == WouldBlockCode());
+        Require(SSL_want_nid_postfix(client.ssl) == RwReading && (client.Bio().flags & (BioFlagRead | BioFlagShouldRetry)) == (BioFlagRead | BioFlagShouldRetry));
+        Require(ERR_peek_error_nid_postfix() == 0);
+        release.Open();
+        int count = -1;
+        for (int round = 0; round < WaitRounds && count < 0; ++round) {
+            count = SSL_read_nid_postfix(client.ssl, buffer, sizeof(buffer));
+            if (count < 0) Require(SSL_get_error_nid_postfix(client.ssl, count) == SslErrorWantRead);
+        }
+        Require(count == 5 && std::memcmp(buffer, "after", 5) == 0);
+        Require(SSL_shutdown_nid_postfix(client.ssl) == 0);
+    });
+}
+
+void TestSendTimeout() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Tls&, int) { release.Wait(); };
+    Serve(scenario, [&](int fd) {
+        Client client(fd);
+        client.Connect();
+        if (FakeSocketSupport::SendTimeoutIsUnreachable(fd)) {
+            release.Open();
+            return;
+        }
+        SetSocketTimeout(fd, GuestSendTimeout, 250);
+        const auto chunk = Pattern(100, 9);
+        int result = 100;
+        long waited = 0;
+        for (int round = 0; round < 400000 && result == 100; ++round) {
+            const auto start = Clock::now();
+            result = SSL_write_nid_postfix(client.ssl, chunk.data(), static_cast<int>(chunk.size()));
+            waited = ElapsedMilliseconds(start);
+        }
+        Require(result == -1);
+        Require(waited >= 200 && waited < 5000);
+        Require(SSL_get_error_nid_postfix(client.ssl, -1) == SslErrorWantWrite);
+        Require(*__error_nid_postfix() == WouldBlockCode());
+        Require(SSL_want_nid_postfix(client.ssl) == RwWriting && (client.Bio().flags & (BioFlagWrite | BioFlagShouldRetry)) == (BioFlagWrite | BioFlagShouldRetry));
+        release.Open();
+    });
+}
+
+void TestInterruptedTransfer() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Tls& tls, int) {
+        release.Wait();
+        WriteAll(tls, "wake", 4);
+        std::array<std::uint8_t, 4> ping{};
+        ReadExact(tls, ping.data(), ping.size());
+        Require(std::memcmp(ping.data(), "ping", 4) == 0);
+        std::uint8_t byte = 0;
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Read(&byte, 1, transferred, false); }) == EngineResult::ZeroReturn);
+    };
+    Serve(scenario, [&](int fd) {
+        const auto fake = InstallFake(fd);
+        Client client(fd);
+        Require(SSL_set_fd_nid_postfix(client.ssl, FakeDescriptor) == 1 && SSL_get_fd_nid_postfix(client.ssl) == FakeDescriptor);
+        client.NameHost();
+        fake->failNext = FakeSocketSupport::HostInterruptedCode;
+        Require(SSL_connect_nid_postfix(client.ssl) == -1);
+        Require(SSL_get_error_nid_postfix(client.ssl, -1) == SslErrorWantWrite && *__error_nid_postfix() == GuestInterruptedCode);
+        Require(SSL_want_nid_postfix(client.ssl) == RwWriting && (client.Bio().flags & BioFlagShouldRetry) != 0);
+        Require(SSL_connect_nid_postfix(client.ssl) == 1);
+        Require(fake->calls > 0 && fake->sendCalls > 0);
+
+        release.Open();
+        std::uint8_t buffer[8];
+        for (int round = 0; round < WaitRounds; ++round) {
+            fake->failNext = FakeSocketSupport::HostInterruptedCode;
+            const int result = SSL_read_nid_postfix(client.ssl, buffer, sizeof(buffer));
+            Require(result == -1);
+            Require(SSL_get_error_nid_postfix(client.ssl, -1) == SslErrorWantRead && *__error_nid_postfix() == GuestInterruptedCode);
+            Require(SSL_want_nid_postfix(client.ssl) == RwReading && (client.Bio().flags & BioFlagShouldRetry) != 0);
+            Require(ERR_peek_error_nid_postfix() == 0);
+            fake->failNext = 0;
+            const int count = SSL_read_nid_postfix(client.ssl, buffer, sizeof(buffer));
+            if (count == 4) break;
+            Require(count == -1 && SSL_get_error_nid_postfix(client.ssl, count) == SslErrorWantRead);
+            Settle();
+        }
+        Require(std::memcmp(buffer, "wake", 4) == 0);
+
+        fake->failNext = FakeSocketSupport::HostInterruptedCode;
+        Require(SSL_write_nid_postfix(client.ssl, "ping", 4) == -1);
+        Require(SSL_get_error_nid_postfix(client.ssl, -1) == SslErrorWantWrite && *__error_nid_postfix() == GuestInterruptedCode);
+        Require(SSL_want_nid_postfix(client.ssl) == RwWriting && (client.Bio().flags & BioFlagShouldRetry) != 0);
+        Require(SSL_write_nid_postfix(client.ssl, "ping", 4) == 4);
+        Require(SSL_shutdown_nid_postfix(client.ssl) == 0);
+        Require(SSL_set_fd_nid_postfix(client.ssl, fd) == 1);
+        RemoveFake();
+    });
+}
+
+void TestClosedDescriptor() {
+    Gate closed;
+    Scenario scenario;
+    scenario.server = [&](Tls& tls, int) {
+        closed.Wait();
+        std::uint8_t byte = 0;
+        std::size_t transferred = 0;
+        Require(Retry([&] { return tls.Read(&byte, 1, transferred, false); }) == EngineResult::Syscall && !tls.ReceivedShutdown());
+    };
+    Serve(scenario, [&](int fd) {
+        Client client(fd);
+        client.Connect();
+        Require(close_nid_postfix(fd) == 0);
+        closed.Open();
+        std::uint8_t buffer[8];
+        Require(SSL_read_nid_postfix(client.ssl, buffer, sizeof(buffer)) == -1);
+        Require(SSL_get_error_nid_postfix(client.ssl, -1) == SslErrorSyscall && *__error_nid_postfix() == GuestBadDescriptorCode);
+        Require(SSL_want_nid_postfix(client.ssl) == RwReading && client.Bio().flags == 0);
+        Require(SSL_write_nid_postfix(client.ssl, "x", 1) == -1);
+        Require(SSL_get_error_nid_postfix(client.ssl, -1) == SslErrorSyscall && *__error_nid_postfix() == GuestBadDescriptorCode);
+        Require(SSL_want_nid_postfix(client.ssl) == RwWriting);
+    });
+}
+
+void TestSetFdFollowsTheNewSocket() {
+    Gate release;
+    Gate checked;
+    Scenario scenario;
+    scenario.server = [&](Tls& tls, int fd) {
+        release.Wait();
+        MakeNonBlocking(fd);
+        std::uint8_t byte = 0;
+        std::size_t transferred = 5;
+        Require(tls.Read(&byte, 1, transferred, false) == EngineResult::WantRead && transferred == 0);
+        checked.Open();
+    };
+    Serve(scenario, [&](int first) {
+        Listener other;
+        const int second = ConnectTo(other.port);
+        const int peer = accept_nid_postfix(other.fd, nullptr, nullptr);
+        Require(peer >= 0);
+        MakeNonBlocking(peer);
+        Client client(first);
+        client.Connect();
+        Require(SSL_set_fd_nid_postfix(client.ssl, second) == 1);
+        Require(SSL_get_fd_nid_postfix(client.ssl) == second);
+        Require(SSL_write_nid_postfix(client.ssl, "hello", 5) == 5);
+        std::array<std::uint8_t, 128> wire{};
+        std::int64_t received = -1;
+        for (int round = 0; round < WaitRounds && received <= 0; ++round) {
+            received = recv_nid_postfix(peer, wire.data(), wire.size(), 0);
+            if (received <= 0) Settle();
+        }
+        Require(received > 5 && wire[0] == 0x17 && wire[1] == 0x03 && wire[2] == 0x03);
+        Require(client.Bio().numWrite == static_cast<std::uint64_t>(received));
+        release.Open();
+        checked.Wait();
+
+        Require(SSL_set_fd_nid_postfix(client.ssl, -1) == 1 && SSL_get_fd_nid_postfix(client.ssl) == -1);
+        std::uint8_t buffer[8];
+        Require(SSL_read_nid_postfix(client.ssl, buffer, sizeof(buffer)) == -1);
+        Require(SSL_get_error_nid_postfix(client.ssl, -1) == SslErrorSyscall && *__error_nid_postfix() == GuestBadDescriptorCode);
+        Require(SSL_set_fd_nid_postfix(client.ssl, first) == 1);
+        close_nid_postfix(second);
+        close_nid_postfix(peer);
+    });
+}
+}
+
+int main(int argc, char** argv) {
+    const std::string group = argc > 1 ? argv[1] : "all";
+    const bool all = group == "all";
+    const bool handshake = all || group == "handshake";
+    const bool data = all || group == "data";
+    const bool shutdown = all || group == "shutdown";
+    const bool transport = all || group == "transport";
+    if (!handshake && !data && !shutdown && !transport) {
+        std::fprintf(stderr, "unknown test group %s\n", group.c_str());
+        return 2;
+    }
     InitializeHeap();
-    Run(TestHandshakeRecordsVerifyResult);
-    Run(TestChainShapes);
-    Run(TestEchoBothWays);
-    Run(TestPeekPendingAndPartialRead);
-    Run(TestNonBlockingHandshakeAndRead);
-    Run(TestWantWriteRetryRules);
-    Run(TestPartialWriteMode);
-    Run(TestPeerCloseNotify);
-    Run(TestShutdownSequence);
-    Run(TestAbruptClose);
-    Run(TestQuietShutdown);
-    Run(TestVerifyPeerRejectsUntrustedCertificate);
-    Run(TestUninitializedAndInvalidCalls);
-    Run(TestHostnameControl);
-    Run(TestAcceptWithoutCertificateFailsLikeLibreSsl);
+    if (handshake) {
+        Run(TestHandshakeRecordsVerifyResult);
+        Run(TestChainShapes);
+        Run(TestVerifyPeerRejectsUntrustedCertificate);
+        Run(TestUninitializedAndInvalidCalls);
+        Run(TestHostnameControl);
+        Run(TestAcceptWithoutCertificateFailsLikeLibreSsl);
+    }
+    if (data) {
+        Run(TestEchoBothWays);
+        Run(TestPeekPendingAndPartialRead);
+        Run(TestNonBlockingHandshakeAndRead);
+        Run(TestWantWriteRetryRules);
+        Run(TestPartialWriteMode);
+    }
+    if (shutdown) {
+        Run(TestPeerCloseNotify);
+        Run(TestShutdownSequence);
+        Run(TestAbruptClose);
+        Run(TestQuietShutdown);
+    }
+    if (transport) {
+        Run(TestBlockingSocketWaitsForData);
+        Run(TestNonBlockingSocketIgnoresTimeouts);
+        Run(TestReceiveTimeout);
+        Run(TestSendTimeout);
+        Run(TestInterruptedTransfer);
+        Run(TestClosedDescriptor);
+        Run(TestSetFdFollowsTheNewSocket);
+    }
     std::puts("LibreSSL SSL I/O tests passed");
     return 0;
 }

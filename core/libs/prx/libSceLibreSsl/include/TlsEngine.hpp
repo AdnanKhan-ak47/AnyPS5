@@ -46,6 +46,7 @@ public:
     Connection& operator=(Connection&&) = delete;
 
     void SetSocket(int guestFd);
+    void DetachSocket();
     int Socket() const;
     void SetHostname(const char* name);
     void SetServerName(const char* name);
