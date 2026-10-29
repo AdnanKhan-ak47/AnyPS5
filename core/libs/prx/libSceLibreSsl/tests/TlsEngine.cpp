@@ -61,6 +61,7 @@ constexpr char WrongHost[] = "other.anyps5-tls.test";
 constexpr int GuestSocketLevel = 0xffff;
 constexpr int GuestNonBlocking = 0x1200;
 constexpr int GuestLingerOption = 0x80;
+constexpr int GuestSendBuffer = 0x1001;
 constexpr int WaitRounds = 5000;
 constexpr std::size_t RecordLimit = 16384;
 
@@ -233,6 +234,22 @@ void Run(const Scenario& scenario) {
     }
     close_nid_postfix(fd);
     serving.join();
+}
+
+std::vector<std::uint8_t> ReceiveRecord(int fd) {
+    std::vector<std::uint8_t> record;
+    std::size_t expected = 5;
+    std::array<std::uint8_t, 64> piece{};
+    for (int round = 0; round < WaitRounds && record.size() < expected; ++round) {
+        const std::int64_t received = recv_nid_postfix(fd, piece.data(), std::min(piece.size(), expected - record.size()), 0);
+        if (received > 0)
+            record.insert(record.end(), piece.data(), piece.data() + received);
+        else
+            Settle();
+        if (record.size() >= 5) expected = 5 + (static_cast<std::size_t>(record[3]) << 8 | record[4]);
+    }
+    Require(record.size() == expected, "the whole record arrived");
+    return record;
 }
 
 void TrustServer(Connection& tls) {
@@ -881,6 +898,34 @@ void SendTimeout() {
     Run(scenario);
 }
 
+void LargeRecordSendTimeout() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Connection&, int) { release.Wait("the client never opened the gate"); };
+    scenario.client = [&](Connection& tls, int fd) {
+        Require(Handshake(tls) == Result::Done, "large record handshake");
+        if (FakeSocketSupport::SendTimeoutIsUnreachable(fd)) {
+            release.Open();
+            return;
+        }
+        const int small = 4096;
+        Require(setsockopt_nid_postfix(fd, GuestSocketLevel, GuestSendBuffer, &small, sizeof(small)) == 0, "shrink the send buffer");
+        SetTimeout(fd, GuestSendTimeout, 250);
+        const auto record = Pattern(RecordLimit, 11);
+        std::size_t transferred = 0;
+        Result result = Result::Done;
+        for (int round = 0; round < 4096 && result == Result::Done; ++round) {
+            const auto start = Clock::now();
+            result = tls.Write(record.data(), record.size(), transferred);
+            Require(ElapsedMilliseconds(start) < 5000, "a record larger than the free send space blocked past the send timeout");
+        }
+        Require(result == Result::WantWrite && transferred == 0, "a peer that stops reading leaves a large record wanting a write");
+        Require(tls.SystemError() == HostWouldBlockCode, "the expired send timeout is reported as would-block");
+        release.Open();
+    };
+    Run(scenario);
+}
+
 #ifndef _WIN32
 void IgnoreSignal(int) {}
 
@@ -1033,14 +1078,9 @@ void ReassignedSocket() {
 
         std::size_t transferred = 0;
         Require(Retry([&] { return tls.Write("hello", 5, transferred); }) == Result::Done && transferred == 5, "write after switching sockets");
-        std::array<std::uint8_t, 128> wire{};
-        std::int64_t received = -1;
-        for (int round = 0; round < WaitRounds && received <= 0; ++round) {
-            received = recv_nid_postfix(peer, wire.data(), wire.size(), 0);
-            if (received <= 0) Settle();
-        }
-        Require(received > 5 && wire[0] == 0x17 && wire[1] == 0x03 && wire[2] == 0x03, "the record went out on the second socket");
-        Require(tls.BytesSent() == sentBefore + static_cast<std::uint64_t>(received), "the byte counter follows the second socket");
+        const auto wire = ReceiveRecord(peer);
+        Require(wire.size() > 5 && wire[0] == 0x17 && wire[1] == 0x03 && wire[2] == 0x03, "the record went out on the second socket");
+        Require(tls.BytesSent() == sentBefore + wire.size(), "the byte counter follows the second socket");
         release.Open();
         checked.Wait("the server never checked the first socket");
 
@@ -1097,6 +1137,7 @@ int main(int argc, char** argv) {
             NonBlockingTransport();
             ReceiveTimeout();
             SendTimeout();
+            LargeRecordSendTimeout();
 #ifndef _WIN32
             SignalInterruptsBlockingRead();
 #endif

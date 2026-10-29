@@ -87,6 +87,7 @@ constexpr char Host[] = "anyps5-tls.test";
 constexpr int GuestSocketLevel = 0xffff;
 constexpr int GuestNonBlocking = 0x1200;
 constexpr int GuestLingerOption = 0x80;
+constexpr int GuestSendBuffer = 0x1001;
 constexpr int WaitRounds = 5000;
 constexpr std::size_t RecordLimit = 16384;
 constexpr int CtrlMode = 33;
@@ -1085,6 +1086,51 @@ void TestSendTimeout() {
     });
 }
 
+void TestLargeRecordSendTimeout() {
+    Gate release;
+    Scenario scenario;
+    scenario.server = [&](Tls&, int) { release.Wait(); };
+    Serve(scenario, [&](int fd) {
+        Client client(fd);
+        client.Connect();
+        if (FakeSocketSupport::SendTimeoutIsUnreachable(fd)) {
+            release.Open();
+            return;
+        }
+        const int small = 4096;
+        Require(setsockopt_nid_postfix(fd, GuestSocketLevel, GuestSendBuffer, &small, sizeof(small)) == 0);
+        SetSocketTimeout(fd, GuestSendTimeout, 250);
+        const auto record = Pattern(RecordLimit, 11);
+        const int size = static_cast<int>(record.size());
+        int result = size;
+        for (int round = 0; round < 4096 && result == size; ++round) {
+            const auto start = Clock::now();
+            result = SSL_write_nid_postfix(client.ssl, record.data(), size);
+            Require(ElapsedMilliseconds(start) < 5000);
+        }
+        Require(result == -1);
+        Require(SSL_get_error_nid_postfix(client.ssl, -1) == SslErrorWantWrite);
+        Require(*__error_nid_postfix() == WouldBlockCode());
+        release.Open();
+    });
+}
+
+std::vector<std::uint8_t> ReceiveRecord(int fd) {
+    std::vector<std::uint8_t> record;
+    std::size_t expected = 5;
+    std::array<std::uint8_t, 64> piece{};
+    for (int round = 0; round < WaitRounds && record.size() < expected; ++round) {
+        const std::int64_t received = recv_nid_postfix(fd, piece.data(), std::min(piece.size(), expected - record.size()), 0);
+        if (received > 0)
+            record.insert(record.end(), piece.data(), piece.data() + received);
+        else
+            Settle();
+        if (record.size() >= 5) expected = 5 + (static_cast<std::size_t>(record[3]) << 8 | record[4]);
+    }
+    Require(record.size() == expected);
+    return record;
+}
+
 void TestInterruptedTransfer() {
     Gate release;
     Scenario scenario;
@@ -1185,14 +1231,9 @@ void TestSetFdFollowsTheNewSocket() {
         Require(SSL_set_fd_nid_postfix(client.ssl, second) == 1);
         Require(SSL_get_fd_nid_postfix(client.ssl) == second);
         Require(SSL_write_nid_postfix(client.ssl, "hello", 5) == 5);
-        std::array<std::uint8_t, 128> wire{};
-        std::int64_t received = -1;
-        for (int round = 0; round < WaitRounds && received <= 0; ++round) {
-            received = recv_nid_postfix(peer, wire.data(), wire.size(), 0);
-            if (received <= 0) Settle();
-        }
-        Require(received > 5 && wire[0] == 0x17 && wire[1] == 0x03 && wire[2] == 0x03);
-        Require(client.Bio().numWrite == static_cast<std::uint64_t>(received));
+        const auto wire = ReceiveRecord(peer);
+        Require(wire.size() > 5 && wire[0] == 0x17 && wire[1] == 0x03 && wire[2] == 0x03);
+        Require(client.Bio().numWrite == wire.size());
         release.Open();
         checked.Wait();
 
@@ -1245,6 +1286,7 @@ int main(int argc, char** argv) {
         Run(TestNonBlockingSocketIgnoresTimeouts);
         Run(TestReceiveTimeout);
         Run(TestSendTimeout);
+        Run(TestLargeRecordSendTimeout);
         Run(TestInterruptedTransfer);
         Run(TestClosedDescriptor);
         Run(TestSetFdFollowsTheNewSocket);

@@ -4,6 +4,7 @@
 #include <winsock2.h>
 #else
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <cerrno>
 #endif
@@ -20,6 +21,7 @@
 #include <mbedtls/x509_crt.h>
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cstring>
 #include <stdexcept>
@@ -111,30 +113,75 @@ int GuestTimeoutMilliseconds(int guestFd, bool send) {
     return static_cast<int>(std::clamp<std::int64_t>(milliseconds, 1, INT_MAX));
 }
 
-std::int64_t NativeTransfer(int guestFd, std::uintptr_t native, bool send, void* buffer, int chunk) {
-    if (!GuestNonBlocking(guestFd)) {
-        if (const int milliseconds = GuestTimeoutMilliseconds(guestFd, send)) {
+std::int64_t NativeAttempt(std::uintptr_t native, bool send, void* buffer, int chunk, bool wait) {
 #ifdef _WIN32
-            WSAPOLLFD ready{static_cast<SOCKET>(native), static_cast<SHORT>(send ? POLLWRNORM : POLLRDNORM), 0};
-            const int waited = WSAPoll(&ready, 1, milliseconds);
-#else
-            pollfd ready{static_cast<int>(native), static_cast<short>(send ? POLLOUT : POLLIN), 0};
-            const int waited = ::poll(&ready, 1, milliseconds);
-#endif
-            if (waited < 0) return -1;
-            if (waited == 0) {
-                SetHostError(HostWouldBlockError);
-                return -1;
-            }
-        }
-    }
-#ifdef _WIN32
+    static_cast<void>(wait);
     return send ? ::send(static_cast<SOCKET>(native), static_cast<const char*>(buffer), chunk, 0)
                 : ::recv(static_cast<SOCKET>(native), static_cast<char*>(buffer), chunk, 0);
 #else
-    return send ? ::send(static_cast<int>(native), buffer, static_cast<std::size_t>(chunk), MSG_NOSIGNAL)
-                : ::recv(static_cast<int>(native), buffer, static_cast<std::size_t>(chunk), 0);
+#ifdef __linux__
+    const int noWait = wait ? 0 : MSG_DONTWAIT;
+#else
+    static_cast<void>(wait);
+    const int noWait = 0;
 #endif
+    return send ? ::send(static_cast<int>(native), buffer, static_cast<std::size_t>(chunk), MSG_NOSIGNAL | noWait)
+                : ::recv(static_cast<int>(native), buffer, static_cast<std::size_t>(chunk), noWait);
+#endif
+}
+
+bool SetHostNonBlocking(std::uintptr_t native, bool enabled) {
+#ifdef _WIN32
+    u_long value = enabled ? 1 : 0;
+    return ioctlsocket(static_cast<SOCKET>(native), FIONBIO, &value) == 0;
+#else
+    int value = enabled ? 1 : 0;
+    return ::ioctl(static_cast<int>(native), FIONBIO, &value) == 0;
+#endif
+}
+
+std::int64_t AttemptWithoutWaiting(int guestFd, std::uintptr_t native, bool send, void* buffer, int chunk) {
+#ifdef __linux__
+    static_cast<void>(guestFd);
+    return NativeAttempt(native, send, buffer, chunk, false);
+#else
+    if (!SetHostNonBlocking(native, true)) return -1;
+    const std::int64_t moved = NativeAttempt(native, send, buffer, chunk, false);
+    const int error = HostError();
+    if (!SetHostNonBlocking(native, GuestNonBlocking(guestFd)) && moved < 0) return -1;
+    SetHostError(error);
+    return moved;
+#endif
+}
+
+std::int64_t TimedTransfer(int guestFd, std::uintptr_t native, bool send, void* buffer, int chunk, int milliseconds) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+    for (;;) {
+        const auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) {
+            SetHostError(HostWouldBlockError);
+            return -1;
+        }
+        const int wait = static_cast<int>(std::min<std::int64_t>(left, INT_MAX));
+#ifdef _WIN32
+        WSAPOLLFD ready{static_cast<SOCKET>(native), static_cast<SHORT>(send ? POLLWRNORM : POLLRDNORM), 0};
+        const int waited = WSAPoll(&ready, 1, wait);
+#else
+        pollfd ready{static_cast<int>(native), static_cast<short>(send ? POLLOUT : POLLIN), 0};
+        const int waited = ::poll(&ready, 1, wait);
+#endif
+        if (waited < 0) return -1;
+        if (waited == 0) continue;
+        const std::int64_t moved = AttemptWithoutWaiting(guestFd, native, send, buffer, chunk);
+        if (moved >= 0 || !HostWouldBlock(HostError())) return moved;
+    }
+}
+
+std::int64_t NativeTransfer(int guestFd, std::uintptr_t native, bool send, void* buffer, int chunk) {
+    if (!GuestNonBlocking(guestFd)) {
+        if (const int milliseconds = GuestTimeoutMilliseconds(guestFd, send)) return TimedTransfer(guestFd, native, send, buffer, chunk, milliseconds);
+    }
+    return NativeAttempt(native, send, buffer, chunk, true);
 }
 
 bool HostTimedOut(int error) {
