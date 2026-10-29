@@ -8,11 +8,27 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <set>
 #include <source_location>
 #include <stdexcept>
 
 using namespace SslLayout;
+
+namespace {
+
+bool failHostAllocations = false;
+
+}
+
+void* operator new(std::size_t size) {
+    if (failHostAllocations) throw std::bad_alloc();
+    if (void* pointer = std::malloc(size ? size : 1)) return pointer;
+    throw std::bad_alloc();
+}
+
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
 
 namespace {
 
@@ -359,6 +375,32 @@ void TestSslNew() {
     SSL_CTX_free_nid_postfix(serverContext);
 }
 
+void TestExDataTeardownUnderHostAllocationFailure() {
+    LibreSslCtx* ctx = SSL_CTX_new_nid_postfix(TLS_client_method_nid_postfix());
+    LibreSsl* ssl = SSL_new_nid_postfix(ctx);
+    Require(ctx && ssl);
+    const int contextBefore = contextReleased;
+    const int sslBefore = sslReleased;
+    failHostAllocations = true;
+    SSL_free_nid_postfix(ssl);
+    SSL_CTX_free_nid_postfix(ctx);
+    failHostAllocations = false;
+    Require(sslReleased == sslBefore + 1 && contextReleased == contextBefore + 1);
+    Require(lastSslReleased == ssl && lastContextReleased == ctx);
+
+    auto* stack = static_cast<LibreSslStack*>(calloc_nid_postfix(1, sizeof(LibreSslStack)));
+    stack->data = static_cast<char**>(calloc_nid_postfix(4, sizeof(char*)));
+    stack->numAlloc = 4;
+    LibreSslExData data{stack};
+    int owner = 0;
+    const int released = sslReleased;
+    failHostAllocations = true;
+    LibreSslFreeExData_nid_no_patch(ExClassSsl, &owner, &data);
+    failHostAllocations = false;
+    Require(sslReleased == released + 1 && lastSslReleased == &owner);
+    Require(data.stack == nullptr);
+}
+
 void TestInheritedDefaults() {
     LibreSslCtx* ctx = SSL_CTX_new_nid_postfix(TLS_client_method_nid_postfix());
     constexpr std::int64_t options = 0x00400000 | 0x4;
@@ -496,6 +538,7 @@ int main() {
     Run(TestContextNew);
     Run(TestContextReferences);
     Run(TestSslNew);
+    Run(TestExDataTeardownUnderHostAllocationFailure);
     Run(TestInheritedDefaults);
     Run(TestInheritedLists);
     Run(TestDescriptors);
