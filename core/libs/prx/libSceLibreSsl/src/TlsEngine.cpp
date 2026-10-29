@@ -105,7 +105,9 @@ int GuestTimeoutMilliseconds(int guestFd, bool send) {
     std::uint32_t length = sizeof(time);
     if (getsockopt_nid_postfix(guestFd, GuestSocketLevel, send ? GuestSendTimeout : GuestReceiveTimeout, &time, &length) != 0 || length != sizeof(time)) return 0;
     if (time.seconds <= 0 && time.microseconds <= 0) return 0;
-    const std::int64_t milliseconds = time.seconds * 1000 + (time.microseconds + 999) / 1000;
+    const std::int64_t seconds = std::clamp<std::int64_t>(time.seconds, 0, INT_MAX / 1000);
+    const std::int64_t microseconds = std::clamp<std::int64_t>(time.microseconds, 0, 999999);
+    const std::int64_t milliseconds = seconds * 1000 + (microseconds + 999) / 1000;
     return static_cast<int>(std::clamp<std::int64_t>(milliseconds, 1, INT_MAX));
 }
 

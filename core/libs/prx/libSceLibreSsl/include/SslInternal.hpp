@@ -145,6 +145,7 @@ extern "C" {
 bool LibreSslIsUndefinedFunction_nid_no_patch(SslStateFunction function);
 void LibreSslPutSslError_nid_no_patch(const LibreSsl* ssl, int reason);
 void LibreSslPutSslErrorX_nid_no_patch(int reason);
+std::int64_t LibreSslSetTlsExtHostName_nid_no_patch(LibreSsl& connection, std::int64_t type, const void* name);
 int LibreSslStateFunction_nid_no_patch(int state);
 
 bool LibreSslNewExData_nid_no_patch(int classIndex, void* object, LibreSslExData* data);

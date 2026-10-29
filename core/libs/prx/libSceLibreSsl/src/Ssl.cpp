@@ -1,10 +1,8 @@
 #include "prx/libSceLibreSsl/include/SslInternal.hpp"
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <stdexcept>
 #include <string>
-#include "prx/libc/include/Api.hpp"
 #include "prx/libc/include/General.hpp"
 
 static_assert(sizeof(LibreSslSslInternal) == 432);
@@ -245,30 +243,8 @@ std::int64_t APS5_VABI SSL_ctrl_nid_postfix(LibreSsl* ssl, int command, std::int
         const Ssl3StateInternal* state = Ssl3Internal(Connection(ssl, __func__), __func__);
         return state ? state->sendConnectionBinding : 0;
     }
-    case ControlSetTlsExtHostName: {
-        LibreSsl& connection = Connection(ssl, __func__);
-        if (argument != SslLayout::TlsExtNameTypeHostName) {
-            LibreSslPutSslError_nid_no_patch(&connection, SslLayout::ReasonServerNameTypeInvalid);
-            return 0;
-        }
-        free_nid_postfix(connection.tlsextHostname);
-        connection.tlsextHostname = nullptr;
-        if (!pointer) return 1;
-        const char* name = static_cast<const char*>(pointer);
-        const std::size_t length = std::strlen(name);
-        if (length > SslLayout::TlsExtMaxHostNameLength) {
-            LibreSslPutSslError_nid_no_patch(&connection, SslLayout::ReasonServerNameInvalid);
-            return 0;
-        }
-        auto* copy = static_cast<char*>(malloc_nid_postfix(length + 1));
-        if (!copy) {
-            LibreSslPutSslError_nid_no_patch(&connection, SslLayout::ErrorInternalError);
-            return 0;
-        }
-        std::memcpy(copy, name, length + 1);
-        connection.tlsextHostname = copy;
-        return 1;
-    }
+    case ControlSetTlsExtHostName:
+        return LibreSslSetTlsExtHostName_nid_no_patch(Connection(ssl, __func__), argument, pointer);
     default:
         NotImplemented_nid_no_patch(("SSL_ctrl: command " + std::to_string(command)).c_str());
     }
