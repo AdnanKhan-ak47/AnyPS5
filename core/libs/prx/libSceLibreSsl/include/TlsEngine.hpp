@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace LibreSslTls {
 
@@ -21,6 +22,18 @@ inline constexpr int SslVerifyPeer = 0x01;
 inline constexpr int SslVerifyFailIfNoPeerCert = 0x02;
 inline constexpr int SslVerifyClientOnce = 0x04;
 
+enum class Failure { None, VerifyFailed, BadWriteRetry, NoSharedCipher, Other };
+
+enum class Direction { None, Read, Write };
+
+enum class ChainShape { None, SelfSignedLeaf, EndsInSelfSigned, Incomplete };
+
+struct WriteOptions {
+    std::size_t fragment = 16384;
+    bool partial = false;
+    bool movingBuffer = false;
+};
+
 int ToSslError(Result result);
 
 class Connection {
@@ -35,20 +48,30 @@ public:
     void SetSocket(int guestFd);
     int Socket() const;
     void SetHostname(const char* name);
+    void SetServerName(const char* name);
     void SetVerifyMode(int sslVerifyMode);
     void TrustCertificates(const unsigned char* pem, std::size_t size);
     void UseCertificate(const unsigned char* certificatePem, std::size_t certificateSize, const unsigned char* keyPem, std::size_t keySize);
 
     Result Handshake();
     Result Read(void* buffer, std::size_t size, std::size_t& transferred, bool peek);
-    Result Write(const void* buffer, std::size_t size, std::size_t& transferred);
+    Result Write(const void* buffer, std::size_t size, std::size_t& transferred, const WriteOptions& options = {});
     Result Shutdown(bool& complete);
     std::size_t Pending() const;
 
     bool HandshakeDone() const;
     bool SentShutdown() const;
     bool ReceivedShutdown() const;
+    bool FatalAlertReceived() const;
+    std::uint64_t BytesReceived() const;
+    std::uint64_t BytesSent() const;
     int SystemError() const;
+    Direction LastDirection() const;
+    Failure FailureKind() const;
+    int FailureCode() const;
+    std::string FailureText() const;
+    ChainShape PeerChain() const;
+    const std::string& PeerServerName() const;
     std::uint32_t VerifyFlags() const;
     const char* Version() const;
     const char* Cipher() const;

@@ -242,6 +242,9 @@ void NotASocket() {
     Require(tls.Handshake() == Result::Ssl, "a handshake without a socket did not fail");
     Require(tls.Read(&byte, 1, transferred, false) == Result::Ssl && transferred == 0, "a read without a socket did not fail");
     Require(tls.Write(&byte, 1, transferred) == Result::Ssl && transferred == 0, "a write without a socket did not fail");
+    Require(tls.FailureKind() == LibreSslTls::Failure::Other && tls.FailureCode() == 0, "a write without a socket is an unclassified failure");
+    Require(tls.PeerChain() == LibreSslTls::ChainShape::None && tls.PeerServerName().empty(), "nothing was seen from a peer");
+    Require(tls.BytesReceived() == 0 && tls.BytesSent() == 0 && tls.LastDirection() == LibreSslTls::Direction::None, "nothing was transferred");
     RequireThrows<std::logic_error>([&] { tls.VerifyFlags(); }, "the verify result was readable before a handshake");
     RequireThrows<std::logic_error>([&] { tls.Version(); }, "the version was readable before a handshake");
     RequireThrows<std::logic_error>([&] { tls.Cipher(); }, "the cipher was readable before a handshake");
@@ -277,6 +280,8 @@ void UntrustedHandshake() {
         Require(Handshake(tls) == Result::Done, "a handshake with an untrusted certificate must complete under SSL_VERIFY_NONE");
         Require(tls.HandshakeDone(), "the handshake was not recorded");
         Require(tls.VerifyFlags() == MBEDTLS_X509_BADCERT_NOT_TRUSTED, "an untrusted certificate must record exactly not-trusted");
+        Require(tls.PeerChain() == LibreSslTls::ChainShape::SelfSignedLeaf, "a single self-signed certificate is recorded as such");
+        Require(tls.FailureKind() == LibreSslTls::Failure::None && tls.BytesReceived() > 0 && tls.BytesSent() > 0, "a completed handshake moved bytes both ways");
         Require(std::strcmp(tls.Version(), "TLSv1.2") == 0, "the negotiated version");
         Require(std::strstr(tls.Cipher(), "ECDHE-ECDSA") != nullptr, "the negotiated cipher");
         Require(tls.Handshake() == Result::Done, "a second handshake call after completion must report done");
@@ -335,6 +340,9 @@ void VerifyPeerClient() {
     rejected.client = [&](Connection& tls, int) {
         tls.SetVerifyMode(LibreSslTls::SslVerifyPeer);
         Require(Handshake(tls) == Result::Ssl, "SSL_VERIFY_PEER with an untrusted certificate must fail the handshake");
+        Require(tls.FailureKind() == LibreSslTls::Failure::VerifyFailed && !tls.FailureText().empty(), "an untrusted certificate is a verify failure");
+        Require(tls.VerifyFlags() == MBEDTLS_X509_BADCERT_NOT_TRUSTED, "the verify flags stay readable after a failed handshake");
+        Require(tls.PeerChain() == LibreSslTls::ChainShape::SelfSignedLeaf, "the failed chain is a single self-signed certificate");
         Require(!tls.HandshakeDone(), "a failed handshake was recorded as done");
         serverSawAlert.Wait("the server never saw the client verify alert");
     };
@@ -393,10 +401,12 @@ void ServerWithoutCertificate() {
     scenario.serverHandshake = false;
     scenario.server = [](Connection& tls, int) {
         Require(Handshake(tls) == Result::Ssl, "a server without a certificate must fail the handshake");
+        Require(tls.FailureKind() == LibreSslTls::Failure::NoSharedCipher && tls.FailureCode() != 0, "a server without a certificate shares no cipher");
     };
     scenario.client = [](Connection& tls, int) {
         Require(Handshake(tls) == Result::Ssl, "a fatal alert during the handshake must be an SSL error");
         Require(tls.ReceivedShutdown(), "a fatal alert must set the received-shutdown state");
+        Require(tls.FailureKind() == LibreSslTls::Failure::Other && tls.FatalAlertReceived(), "a fatal alert is an unclassified failure");
         std::size_t transferred = 5;
         char byte = 0;
         Require(tls.Read(&byte, 1, transferred, false) == Result::Syscall && transferred == 0,
@@ -534,12 +544,74 @@ void NonBlockingRead() {
         Require(LibreSslTls::ToSslError(Result::WantRead) == LibreSslTls::SslErrorWantRead, "the result maps to SSL_ERROR_WANT_READ");
         Require(tls.Pending() == 0, "nothing is pending");
         Require(tls.SystemError() != 0, "the would-block errno is visible");
+        Require(tls.LastDirection() == LibreSslTls::Direction::Read, "the would-block transfer was a read");
         gate.Open();
         Require(Retry([&] { return tls.Read(out.data(), out.size(), transferred, false); }) == Result::Done && transferred == 5
                 && std::memcmp(out.data(), "ready", 5) == 0,
             "the data sent after the gate opened");
         bool complete = false;
         Require(Retry([&] { return tls.Shutdown(complete); }) == Result::Done, "close the non-blocking connection");
+    };
+    Run(scenario);
+}
+
+void ServerNameOnly() {
+    Scenario sniOnly;
+    sniOnly.server = [](Connection& tls, int) { Require(tls.PeerServerName() == WrongHost, "the server must see the name the client set"); };
+    sniOnly.client = [](Connection& tls, int) {
+        TrustServer(tls);
+        tls.SetVerifyMode(LibreSslTls::SslVerifyPeer);
+        tls.SetServerName(WrongHost);
+        Require(Handshake(tls) == Result::Done, "a name that does not match the certificate must not fail when it is only sent as SNI");
+        Require(tls.VerifyFlags() == 0, "an SNI-only name must not leave a name mismatch flag");
+    };
+    Run(sniOnly);
+
+    Scenario verified;
+    verified.serverHandshake = false;
+    verified.server = [](Connection& tls, int) { Require(Handshake(tls) != Result::Done, "the server must not complete a handshake the client rejected"); };
+    verified.client = [](Connection& tls, int) {
+        TrustServer(tls);
+        tls.SetVerifyMode(LibreSslTls::SslVerifyPeer);
+        tls.SetHostname(WrongHost);
+        Require(Handshake(tls) == Result::Ssl && tls.FailureKind() == LibreSslTls::Failure::VerifyFailed, "a verified name mismatch must fail the handshake");
+        Require(tls.VerifyFlags() == MBEDTLS_X509_BADCERT_CN_MISMATCH, "the mismatch is the only recorded flag");
+    };
+    Run(verified);
+}
+
+void WriteOptions() {
+    constexpr std::size_t Expected = 16384 + 1000 + 5000;
+    const auto payload = Pattern(40000, 6);
+    Scenario scenario;
+    scenario.server = [&](Connection& tls, int) {
+        std::vector<std::uint8_t> sink(RecordLimit);
+        std::size_t total = 0;
+        for (;;) {
+            std::size_t transferred = 0;
+            const Result result = Retry([&] { return tls.Read(sink.data(), sink.size(), transferred, false); });
+            if (result == Result::ZeroReturn) break;
+            Require(result == Result::Done, "the server read failed");
+            total += transferred;
+        }
+        Require(total == Expected, "the server received a different number of bytes than the writes reported");
+    };
+    scenario.client = [&](Connection& tls, int) {
+        Require(Handshake(tls) == Result::Done, "write options handshake");
+        std::size_t transferred = 0;
+        LibreSslTls::WriteOptions partial;
+        partial.partial = true;
+        Require(tls.Write(payload.data(), payload.size(), transferred, partial) == Result::Done && transferred == 16384, "a partial write returns after one default fragment");
+        partial.fragment = 1000;
+        Require(tls.Write(payload.data(), payload.size(), transferred, partial) == Result::Done && transferred == 1000, "a partial write honours the fragment size");
+        LibreSslTls::WriteOptions whole;
+        whole.fragment = 1000;
+        Require(tls.Write(payload.data(), 5000, transferred, whole) == Result::Done && transferred == 5000, "a complete write loops over every fragment");
+        LibreSslTls::WriteOptions empty;
+        empty.fragment = 0;
+        RequireThrows<std::invalid_argument>([&] { tls.Write(payload.data(), 1, transferred, empty); }, "a zero fragment size was accepted");
+        bool complete = false;
+        Require(Retry([&] { return tls.Shutdown(complete); }) == Result::Done, "close the write options connection");
     };
     Run(scenario);
 }
@@ -571,6 +643,12 @@ void WriteBackPressure() {
                 std::vector<std::uint8_t> moved(payload);
                 Require(tls.Write(moved.data(), moved.size(), transferred) == Result::Ssl && transferred == 0,
                     "retrying a stalled write with another buffer is a bad write retry");
+                Require(tls.FailureKind() == LibreSslTls::Failure::BadWriteRetry, "a bad write retry is classified");
+                Require(tls.Write(payload.data(), 10, transferred) == Result::Ssl && tls.FailureKind() == LibreSslTls::Failure::BadWriteRetry,
+                    "retrying a stalled write with a shorter length is a bad write retry");
+                LibreSslTls::WriteOptions moving;
+                moving.movingBuffer = true;
+                Require(tls.Write(moved.data(), moved.size(), transferred, moving) != Result::Ssl, "a moving write buffer is accepted when the option is set");
             }
             Require(++rounds < WaitRounds, "the stalled write never finished");
             Settle();
@@ -639,6 +717,7 @@ void AbruptClose() {
             "end of stream without close_notify must be a syscall error");
         Require(!tls.ReceivedShutdown(), "an unexpected end of stream is not a received shutdown");
         Require(tls.SystemError() == 0, "an orderly end of stream leaves errno clear");
+        Require(tls.LastDirection() == LibreSslTls::Direction::Read, "the failing transfer was a read");
         Require(tls.Read(out.data(), out.size(), transferred, false) == Result::Syscall, "reading again stays a syscall error");
         Result result = Result::Done;
         for (int attempt = 0; attempt < 200 && result == Result::Done; ++attempt) {
@@ -693,6 +772,8 @@ int main() {
         Shutdown();
         ShutdownBeforeHandshake();
         AbruptClose();
+        ServerNameOnly();
+        WriteOptions();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "failed: %s\n", error.what());
         return 1;

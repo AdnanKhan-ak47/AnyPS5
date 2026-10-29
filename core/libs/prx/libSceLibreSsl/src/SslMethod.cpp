@@ -185,20 +185,20 @@ const LibreSslEncMethod dtlsEnc{reinterpret_cast<void*>(EncUnavailable), EncFlag
 const LibreSslMethodInternal tlsClientInternal{
     Tls1_2Version, Tls1Version, Tls1_2Version,
     TlsNew, TlsClear, TlsFree,
-    UndefinedFunction, ConnectUnavailable,
-    ReadUnavailable, PeekUnavailable, WriteUnavailable, ShutdownUnavailable,
+    UndefinedFunction, LibreSslConnect_nid_no_patch,
+    LibreSslRead_nid_no_patch, LibreSslPeek_nid_no_patch, LibreSslWrite_nid_no_patch, LibreSslShutdown_nid_no_patch,
     UndefinedFunction, AlwaysOk,
     GetMessageUnavailable, ReadBytesUnavailable, WriteBytesUnavailable,
-    PendingUnavailable, GetMethodUnavailable, TlsDefaultTimeout, UndefinedVoidFunction, &tlsEnc};
+    LibreSslPending_nid_no_patch, GetMethodUnavailable, TlsDefaultTimeout, UndefinedVoidFunction, &tlsEnc};
 
 const LibreSslMethodInternal tlsServerInternal{
     Tls1_2Version, Tls1Version, Tls1_2Version,
     TlsNew, TlsClear, TlsFree,
-    AcceptUnavailable, UndefinedFunction,
-    ReadUnavailable, PeekUnavailable, WriteUnavailable, ShutdownUnavailable,
+    LibreSslAccept_nid_no_patch, UndefinedFunction,
+    LibreSslRead_nid_no_patch, LibreSslPeek_nid_no_patch, LibreSslWrite_nid_no_patch, LibreSslShutdown_nid_no_patch,
     UndefinedFunction, AlwaysOk,
     GetMessageUnavailable, ReadBytesUnavailable, WriteBytesUnavailable,
-    PendingUnavailable, GetMethodUnavailable, TlsDefaultTimeout, UndefinedVoidFunction, &tlsEnc};
+    LibreSslPending_nid_no_patch, GetMethodUnavailable, TlsDefaultTimeout, UndefinedVoidFunction, &tlsEnc};
 
 const LibreSslMethodInternal dtlsClientInternal{
     Dtls1Version, Dtls1Version, Dtls1Version,
@@ -250,6 +250,10 @@ int LibreSslStateFunction_nid_no_patch(int state) {
     case StateOk | StateConnect: return 79;
     case StateBefore | StateAccept: return 80;
     case StateOk | StateAccept: return 81;
+    case StateConnectHelloA: return 2;
+    case StateConnectCertB: return 7;
+    case StateAcceptHelloA: return 37;
+    case StateAcceptHelloC: return 39;
     default: NotImplemented_nid_no_patch("SSLerror: handshake state not modelled");
     }
 }

@@ -97,10 +97,9 @@ int ToSslError(Result result) {
 struct Connection::State {
     struct PendingWrite {
         bool active = false;
-        const void* buffer = nullptr;
+        const unsigned char* at = nullptr;
         std::size_t progress = 0;
-        std::size_t argumentLength = 0;
-        std::size_t chunk = 0;
+        std::size_t fragment = 0;
     };
 
     bool server;
@@ -111,13 +110,22 @@ struct Connection::State {
     int verifyMode = SslVerifyNone;
     std::string hostname;
     bool hostnameSet = false;
+    bool hostnameVerifies = true;
     bool haveIdentity = false;
     bool prepared = false;
     bool handshaken = false;
     bool sentShutdown = false;
     bool receivedShutdown = false;
     bool closeNotifyReceived = false;
+    bool fatalAlert = false;
+    std::uint64_t receivedTotal = 0;
+    std::uint64_t sentTotal = 0;
     bool alertPending = false;
+    Direction direction = Direction::None;
+    Failure failure = Failure::None;
+    int failureCode = 0;
+    std::vector<bool> chain;
+    std::string peerServerName;
     std::vector<unsigned char> held;
     std::size_t heldOffset = 0;
     std::vector<unsigned char> scratch;
@@ -173,6 +181,8 @@ struct Connection::State {
     void Prepare() {
         if (prepared) return;
         mbedtls_ssl_conf_authmode(&config, AuthenticationMode());
+        mbedtls_ssl_conf_verify(&config, Verify, this);
+        if (server) mbedtls_ssl_conf_sni(&config, ServerName, this);
         if (trusted.raw.p) mbedtls_ssl_conf_ca_chain(&config, &trusted, nullptr);
         if (haveIdentity) {
             if (int result = mbedtls_ssl_conf_own_cert(&config, &own, &key)) Fail("certificate setup failed", result);
@@ -198,7 +208,9 @@ struct Connection::State {
 #else
             const auto sent = ::send(static_cast<int>(self.native), buffer, static_cast<std::size_t>(chunk), MSG_NOSIGNAL);
 #endif
+            if (sent > 0) self.sentTotal += static_cast<std::uint64_t>(sent);
             if (sent >= 0) return static_cast<int>(sent);
+            self.direction = Direction::Write;
             const int error = HostError();
             if (HostInterrupted(error)) continue;
             self.hostError = error;
@@ -206,6 +218,21 @@ struct Connection::State {
             if (HostReset(error)) return MBEDTLS_ERR_NET_CONN_RESET;
             return MBEDTLS_ERR_NET_SEND_FAILED;
         }
+    }
+
+    static int Verify(void* argument, mbedtls_x509_crt* certificate, int depth, std::uint32_t* flags) {
+        auto& self = *static_cast<State*>(argument);
+        const auto index = static_cast<std::size_t>(depth);
+        if (self.chain.size() <= index) self.chain.resize(index + 1, false);
+        self.chain[index] = certificate->issuer_raw.len == certificate->subject_raw.len
+            && std::memcmp(certificate->issuer_raw.p, certificate->subject_raw.p, certificate->subject_raw.len) == 0;
+        if (depth == 0 && !self.hostnameVerifies) *flags &= ~static_cast<std::uint32_t>(MBEDTLS_X509_BADCERT_CN_MISMATCH);
+        return 0;
+    }
+
+    static int ServerName(void* argument, mbedtls_ssl_context*, const unsigned char* name, std::size_t length) {
+        static_cast<State*>(argument)->peerServerName.assign(reinterpret_cast<const char*>(name), length);
+        return 0;
     }
 
     static int Receive(void* argument, unsigned char* buffer, std::size_t length) {
@@ -221,7 +248,12 @@ struct Connection::State {
 #else
             const auto received = ::recv(static_cast<int>(self.native), buffer, static_cast<std::size_t>(chunk), 0);
 #endif
-            if (received >= 0) return static_cast<int>(received);
+            if (received > 0) {
+                self.receivedTotal += static_cast<std::uint64_t>(received);
+                return static_cast<int>(received);
+            }
+            self.direction = Direction::Read;
+            if (received == 0) return 0;
             const int error = HostError();
             if (HostInterrupted(error)) continue;
             self.hostError = error;
@@ -241,19 +273,36 @@ struct Connection::State {
                 return Result::ZeroReturn;
             case MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE:
                 receivedShutdown = true;
-                return Result::Ssl;
+                fatalAlert = true;
+                return Failed(Failure::Other, code);
+            case MBEDTLS_ERR_X509_CERT_VERIFY_FAILED:
+            case MBEDTLS_ERR_SSL_CA_CHAIN_REQUIRED: return Failed(Failure::VerifyFailed, code);
+            case MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE: return Failed(server ? Failure::NoSharedCipher : Failure::Other, code);
             case 0:
             case MBEDTLS_ERR_SSL_CONN_EOF:
             case MBEDTLS_ERR_NET_CONN_RESET:
             case MBEDTLS_ERR_NET_RECV_FAILED:
             case MBEDTLS_ERR_NET_SEND_FAILED: return Result::Syscall;
-            default: return Result::Ssl;
+            default: return Failed(Failure::Other, code);
         }
+    }
+
+    Result Failed(Failure kind, int code) {
+        failure = kind;
+        failureCode = code;
+        return Result::Ssl;
+    }
+
+    void BeginOperation() {
+        hostError = 0;
+        direction = Direction::None;
+        failure = Failure::None;
+        failureCode = 0;
     }
 
     Result Establish() {
         if (handshaken) return Result::Done;
-        if (guestFd < 0) return Result::Ssl;
+        if (guestFd < 0) return Failed(Failure::Other, 0);
         Prepare();
         const int code = mbedtls_ssl_handshake(&ssl);
         if (code == 0) {
@@ -304,6 +353,14 @@ void Connection::SetHostname(const char* name) {
     state->RequireUnstarted("SetHostname");
     state->hostnameSet = name != nullptr;
     state->hostname = name ? name : "";
+    state->hostnameVerifies = true;
+}
+
+void Connection::SetServerName(const char* name) {
+    state->RequireUnstarted("SetServerName");
+    state->hostnameSet = name != nullptr;
+    state->hostname = name ? name : "";
+    state->hostnameVerifies = false;
 }
 
 void Connection::SetVerifyMode(int sslVerifyMode) {
@@ -342,6 +399,7 @@ void Connection::UseCertificate(const unsigned char* certificatePem, std::size_t
 
 Result Connection::Handshake() {
     auto& self = *state;
+    self.BeginOperation();
     if (self.handshaken) return Result::Done;
     if (self.receivedShutdown) return self.closeNotifyReceived ? Result::ZeroReturn : Result::Syscall;
     return self.Establish();
@@ -352,6 +410,7 @@ Result Connection::Read(void* buffer, std::size_t size, std::size_t& transferred
     if (size > static_cast<std::size_t>(INT_MAX)) throw std::invalid_argument("LibreSSL TLS engine: read length exceeds INT_MAX");
     if (!buffer && size) throw std::invalid_argument("LibreSSL TLS engine: null read buffer");
     auto& self = *state;
+    self.BeginOperation();
     if (self.receivedShutdown) return self.closeNotifyReceived ? Result::ZeroReturn : Result::Syscall;
     if (const auto established = self.Establish(); established != Result::Done) return established;
     if (!self.HeldAvailable()) {
@@ -382,43 +441,52 @@ Result Connection::Read(void* buffer, std::size_t size, std::size_t& transferred
     return size == 0 ? Result::Syscall : Result::Done;
 }
 
-Result Connection::Write(const void* buffer, std::size_t size, std::size_t& transferred) {
+Result Connection::Write(const void* buffer, std::size_t size, std::size_t& transferred, const WriteOptions& options) {
     transferred = 0;
     if (size > static_cast<std::size_t>(INT_MAX)) throw std::invalid_argument("LibreSSL TLS engine: write length exceeds INT_MAX");
     if (!buffer && size) throw std::invalid_argument("LibreSSL TLS engine: null write buffer");
+    if (options.fragment == 0) throw std::invalid_argument("LibreSSL TLS engine: zero write fragment size");
     auto& self = *state;
+    self.BeginOperation();
     if (const auto established = self.Establish(); established != Result::Done) return established;
-    if (self.sentShutdown) return Result::Ssl;
+    if (self.sentShutdown) return self.Failed(Failure::Other, 0);
     auto& pending = self.pendingWrite;
-    if (!pending.active && size == 0) return Result::Syscall;
     const auto* bytes = static_cast<const unsigned char*>(buffer);
-    std::size_t progress = 0;
-    if (pending.active) {
-        progress = pending.progress;
-        if (buffer != pending.buffer || size < progress || std::min(size - progress, self.OutputCapacity()) < pending.chunk)
-            return Result::Ssl;
-    }
-    while (progress < size || pending.active) {
-        const bool retry = pending.active;
-        const auto length = retry ? pending.argumentLength : size - progress;
-        const int code = mbedtls_ssl_write(&self.ssl, bytes + progress, length);
+    std::size_t total = pending.active ? pending.progress : 0;
+    std::size_t remaining = std::max(size, total) - total;
+    for (;;) {
+        const std::size_t fragment = std::min(remaining, options.fragment);
+        const unsigned char* at = bytes ? bytes + total : nullptr;
+        std::size_t length = fragment;
+        if (pending.active) {
+            if (pending.fragment > fragment || (at != pending.at && !options.movingBuffer)) return self.Failed(Failure::BadWriteRetry, 0);
+            length = pending.fragment;
+        } else if (fragment == 0) {
+            return Result::Syscall;
+        }
+        const int code = mbedtls_ssl_write(&self.ssl, at, length);
         if (code > 0) {
-            pending.active = false;
-            progress += static_cast<std::size_t>(code);
+            pending = {};
+            const auto written = static_cast<std::size_t>(code);
+            if (written == remaining || options.partial) {
+                transferred = total + written;
+                return Result::Done;
+            }
+            remaining -= written;
+            total += written;
             continue;
         }
         if (code == MBEDTLS_ERR_SSL_WANT_READ || code == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            if (!retry) pending = {true, buffer, progress, length, std::min(length, self.OutputCapacity())};
+            if (!pending.active) pending = {true, at, total, fragment};
             return self.Classify(code);
         }
         pending = {};
         return self.Classify(code);
     }
-    transferred = progress;
-    return Result::Done;
 }
 
 Result Connection::Shutdown(bool& complete) {
+    state->BeginOperation();
     complete = false;
     auto& self = *state;
     if (!self.handshaken) {
@@ -460,10 +528,37 @@ bool Connection::SentShutdown() const { return state->sentShutdown; }
 
 bool Connection::ReceivedShutdown() const { return state->receivedShutdown; }
 
+bool Connection::FatalAlertReceived() const { return state->fatalAlert; }
+
+std::uint64_t Connection::BytesReceived() const { return state->receivedTotal; }
+
+std::uint64_t Connection::BytesSent() const { return state->sentTotal; }
+
 int Connection::SystemError() const { return state->hostError; }
 
+Direction Connection::LastDirection() const { return state->direction; }
+
+Failure Connection::FailureKind() const { return state->failure; }
+
+int Connection::FailureCode() const { return state->failureCode; }
+
+std::string Connection::FailureText() const {
+    char text[160];
+    mbedtls_strerror(state->failureCode, text, sizeof(text));
+    return text;
+}
+
+ChainShape Connection::PeerChain() const {
+    const auto& chain = state->chain;
+    if (chain.empty()) return ChainShape::None;
+    if (chain.size() == 1) return chain.front() ? ChainShape::SelfSignedLeaf : ChainShape::Incomplete;
+    return chain.back() ? ChainShape::EndsInSelfSigned : ChainShape::Incomplete;
+}
+
+const std::string& Connection::PeerServerName() const { return state->peerServerName; }
+
 std::uint32_t Connection::VerifyFlags() const {
-    if (!state->handshaken) throw std::logic_error("LibreSSL TLS engine: the verify result is read before the handshake finished");
+    if (!state->handshaken && state->failure != Failure::VerifyFailed) throw std::logic_error("LibreSSL TLS engine: the verify result is read before the handshake finished");
     return mbedtls_ssl_get_verify_result(&state->ssl);
 }
 
