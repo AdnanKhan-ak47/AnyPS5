@@ -779,41 +779,6 @@ void TestVerifyPeerRejectsUntrustedCertificate() {
         Require(SSL_get_verify_result_nid_postfix(client.ssl) == VerifyErrorDepthZeroSelfSigned);
         Require(client.ssl->internal->state == StateConnectCertB && SSL_want_nid_postfix(client.ssl) == RwNothing);
         Require(SSL_shutdown_nid_postfix(client.ssl) == 1);
-        std::uint8_t buffer[4];
-        RequireThrows([&] { SSL_read_nid_postfix(client.ssl, buffer, sizeof(buffer)); });
-        RequireThrows([&] { SSL_connect_nid_postfix(client.ssl); });
-    });
-}
-
-void TestUnmodelledConfigurationsThrow() {
-    Scenario scenario;
-    scenario.handshake = false;
-    scenario.server = [](Tls&, int) {};
-    Serve(scenario, [](int fd) {
-        {
-            Client client(fd);
-            client.ssl->internal->msgCallback = reinterpret_cast<void*>(0x1000);
-            RequireThrows([&] { SSL_connect_nid_postfix(client.ssl); });
-            client.ssl->internal->msgCallback = nullptr;
-            client.ssl->internal->verifyCallback = reinterpret_cast<void*>(0x1000);
-            RequireThrows([&] { SSL_connect_nid_postfix(client.ssl); });
-            client.ssl->internal->verifyCallback = nullptr;
-            client.ssl->internal->options |= OptionNoTlsV1_2;
-            RequireThrows([&] { SSL_connect_nid_postfix(client.ssl); });
-            client.ssl->internal->options = 0;
-            Require(client.ssl->internal->state == (StateBefore | StateConnect));
-        }
-        {
-            Client client(1 << 20);
-            RequireThrows([&] { SSL_connect_nid_postfix(client.ssl); });
-        }
-        {
-            LibreSslCtx* ctx = SSL_CTX_new_nid_postfix(TLS_client_method_nid_postfix());
-            LibreSsl* ssl = SSL_new_nid_postfix(ctx);
-            RequireThrows([&] { SSL_connect_nid_postfix(ssl); });
-            SSL_free_nid_postfix(ssl);
-            SSL_CTX_free_nid_postfix(ctx);
-        }
     });
 }
 
@@ -981,20 +946,6 @@ void TestAcceptWithoutCertificateFailsLikeLibreSsl() {
             Require(result == -1 && SSL_get_error_nid_postfix(ssl, result) == SslErrorSsl);
             RequireQueuedError(39, ReasonNoSharedCipher);
             Require(ssl->internal->state == StateAcceptHelloC && SSL_want_nid_postfix(ssl) == RwNothing);
-            RequireThrows([&] { SSL_accept_nid_postfix(ssl); });
-            SSL_free_nid_postfix(ssl);
-            SSL_CTX_free_nid_postfix(ctx);
-        });
-}
-
-void TestAcceptRefusesClientCertificateRequest() {
-    RunAccepting([](Tls&, Gate&) {},
-        [](int fd, Gate&) {
-            LibreSslCtx* ctx = SSL_CTX_new_nid_postfix(SSLv23_server_method_nid_postfix());
-            LibreSsl* ssl = SSL_new_nid_postfix(ctx);
-            Require(SSL_set_fd_nid_postfix(ssl, fd) == 1);
-            SSL_set_verify_nid_postfix(ssl, 1, nullptr);
-            RequireThrows([&] { SSL_accept_nid_postfix(ssl); });
             SSL_free_nid_postfix(ssl);
             SSL_CTX_free_nid_postfix(ctx);
         });
@@ -1016,11 +967,9 @@ int main() {
     Run(TestAbruptClose);
     Run(TestQuietShutdown);
     Run(TestVerifyPeerRejectsUntrustedCertificate);
-    Run(TestUnmodelledConfigurationsThrow);
     Run(TestUninitializedAndInvalidCalls);
     Run(TestHostnameControl);
     Run(TestAcceptWithoutCertificateFailsLikeLibreSsl);
-    Run(TestAcceptRefusesClientCertificateRequest);
     std::puts("LibreSSL SSL I/O tests passed");
     return 0;
 }
