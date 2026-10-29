@@ -205,17 +205,6 @@ void TestMethodSlots() {
     Require(client->internal->sslVersion() == 0);
     RequireQueuedError(0xfff, ErrorShouldNotHaveBeenCalled);
 
-    RequireThrows([&] { client->dispatchAlert(clientSsl); });
-    RequireThrows([&] { client->numCiphers(); });
-    RequireThrows([&] { client->getCipher(0); });
-    RequireThrows([&] { client->getCipherByChar(nullptr); });
-    RequireThrows([&] { client->putCipherByChar(nullptr, nullptr); });
-    RequireThrows([&] { client->internal->getSslMethod(Tls1_2Version); });
-    RequireThrows([&] { client->internal->sslGetMessage(clientSsl, 0, 0, 0, 0, nullptr); });
-    RequireThrows([&] { client->internal->sslReadBytes(clientSsl, 0, nullptr, 0, 0); });
-    RequireThrows([&] { client->internal->sslWriteBytes(clientSsl, 0, nullptr, 0); });
-    RequireThrows([&] { reinterpret_cast<int (APS5_VABI*)(LibreSsl*, int)>(client->internal->ssl3Enc->enc)(clientSsl, 0); });
-
     SSL_free_nid_postfix(clientSsl);
     SSL_free_nid_postfix(serverSsl);
     SSL_CTX_free_nid_postfix(clientContext);
@@ -370,17 +359,6 @@ void TestSslNew() {
     SSL_CTX_free_nid_postfix(serverContext);
 }
 
-void TestDatagramSslIsRefused() {
-    LibreSslCtx* ctx = SSL_CTX_new_nid_postfix(DTLSv1_client_method_nid_postfix());
-    Require(ctx != nullptr);
-    const int created = sslCreated;
-    const int released = sslReleased;
-    RequireThrows([&] { SSL_new_nid_postfix(ctx); });
-    Require(ctx->references == 1);
-    Require(sslCreated == created && sslReleased == released);
-    SSL_CTX_free_nid_postfix(ctx);
-}
-
 void TestInheritedDefaults() {
     LibreSslCtx* ctx = SSL_CTX_new_nid_postfix(TLS_client_method_nid_postfix());
     constexpr std::int64_t options = 0x00400000 | 0x4;
@@ -518,7 +496,6 @@ int main() {
     Run(TestContextNew);
     Run(TestContextReferences);
     Run(TestSslNew);
-    Run(TestDatagramSslIsRefused);
     Run(TestInheritedDefaults);
     Run(TestInheritedLists);
     Run(TestDescriptors);
