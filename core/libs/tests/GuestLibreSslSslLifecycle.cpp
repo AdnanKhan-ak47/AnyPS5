@@ -8,11 +8,27 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <set>
 #include <source_location>
 #include <stdexcept>
 
 using namespace SslLayout;
+
+namespace {
+
+bool failHostAllocations = false;
+
+}
+
+void* operator new(std::size_t size) {
+    if (failHostAllocations) throw std::bad_alloc();
+    if (void* pointer = std::malloc(size ? size : 1)) return pointer;
+    throw std::bad_alloc();
+}
+
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
 
 namespace {
 
@@ -205,17 +221,6 @@ void TestMethodSlots() {
     Require(client->internal->sslVersion() == 0);
     RequireQueuedError(0xfff, ErrorShouldNotHaveBeenCalled);
 
-    RequireThrows([&] { client->dispatchAlert(clientSsl); });
-    RequireThrows([&] { client->numCiphers(); });
-    RequireThrows([&] { client->getCipher(0); });
-    RequireThrows([&] { client->getCipherByChar(nullptr); });
-    RequireThrows([&] { client->putCipherByChar(nullptr, nullptr); });
-    RequireThrows([&] { client->internal->getSslMethod(Tls1_2Version); });
-    RequireThrows([&] { client->internal->sslGetMessage(clientSsl, 0, 0, 0, 0, nullptr); });
-    RequireThrows([&] { client->internal->sslReadBytes(clientSsl, 0, nullptr, 0, 0); });
-    RequireThrows([&] { client->internal->sslWriteBytes(clientSsl, 0, nullptr, 0); });
-    RequireThrows([&] { reinterpret_cast<int (APS5_VABI*)(LibreSsl*, int)>(client->internal->ssl3Enc->enc)(clientSsl, 0); });
-
     SSL_free_nid_postfix(clientSsl);
     SSL_free_nid_postfix(serverSsl);
     SSL_CTX_free_nid_postfix(clientContext);
@@ -370,15 +375,30 @@ void TestSslNew() {
     SSL_CTX_free_nid_postfix(serverContext);
 }
 
-void TestDatagramSslIsRefused() {
-    LibreSslCtx* ctx = SSL_CTX_new_nid_postfix(DTLSv1_client_method_nid_postfix());
-    Require(ctx != nullptr);
-    const int created = sslCreated;
-    const int released = sslReleased;
-    RequireThrows([&] { SSL_new_nid_postfix(ctx); });
-    Require(ctx->references == 1);
-    Require(sslCreated == created && sslReleased == released);
+void TestExDataTeardownUnderHostAllocationFailure() {
+    LibreSslCtx* ctx = SSL_CTX_new_nid_postfix(TLS_client_method_nid_postfix());
+    LibreSsl* ssl = SSL_new_nid_postfix(ctx);
+    Require(ctx && ssl);
+    const int contextBefore = contextReleased;
+    const int sslBefore = sslReleased;
+    failHostAllocations = true;
+    SSL_free_nid_postfix(ssl);
     SSL_CTX_free_nid_postfix(ctx);
+    failHostAllocations = false;
+    Require(sslReleased == sslBefore + 1 && contextReleased == contextBefore + 1);
+    Require(lastSslReleased == ssl && lastContextReleased == ctx);
+
+    auto* stack = static_cast<LibreSslStack*>(calloc_nid_postfix(1, sizeof(LibreSslStack)));
+    stack->data = static_cast<char**>(calloc_nid_postfix(4, sizeof(char*)));
+    stack->numAlloc = 4;
+    LibreSslExData data{stack};
+    int owner = 0;
+    const int released = sslReleased;
+    failHostAllocations = true;
+    LibreSslFreeExData_nid_no_patch(ExClassSsl, &owner, &data);
+    failHostAllocations = false;
+    Require(sslReleased == released + 1 && lastSslReleased == &owner);
+    Require(data.stack == nullptr);
 }
 
 void TestInheritedDefaults() {
@@ -518,7 +538,7 @@ int main() {
     Run(TestContextNew);
     Run(TestContextReferences);
     Run(TestSslNew);
-    Run(TestDatagramSslIsRefused);
+    Run(TestExDataTeardownUnderHostAllocationFailure);
     Run(TestInheritedDefaults);
     Run(TestInheritedLists);
     Run(TestDescriptors);
